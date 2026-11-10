@@ -1,0 +1,22 @@
+[package]
+name = "messenger-relay"
+description = "The relay server: key directory, short-lived encrypted mailboxes and per-chat ordering. It never decrypts anything."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8"
+base64.workspace = true
+hex.workspace = true
+messenger-protocol.workspace = true
+rand.workspace = true
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

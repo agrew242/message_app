@@ -1,0 +1,16 @@
+[package]
+name = "messenger-core"
+description = "The encryption core: MLS (RFC 9420) via OpenMLS. No networking or platform storage here, so the same code can be built for the web (WebAssembly) and for iPhone."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+base64.workspace = true
+hex.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
