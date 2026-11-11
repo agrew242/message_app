@@ -554,6 +554,27 @@ async function press(page, label) {
   await handle.click();
 }
 
+/** Records what the app's live connection delivers, for diagnosis. */
+async function recordUpdates(page) {
+  await page.waitForFunction(() => window.messengerWeb, { timeout: 30000 });
+  await page.evaluate(() => {
+    window.__updates = [];
+    window.messengerWeb.listen((t) => window.__updates.push(`${new Date().toISOString().slice(11, 23)} ${t.slice(0, 400)}`));
+  });
+}
+
+/** What the encryption core holds, read past the UI (or why it can't be). */
+async function engineState(page) {
+  const read = page.evaluate(async () => {
+    const env = JSON.parse(await window.messengerWeb.invoke('chatList', '[]'));
+    if (!env.ok) return `chatList failed: ${env.kind} ${env.message}`;
+    return JSON.parse(env.value).map((c) => ({ title: c.title, unread: c.unread, last: c.last?.body || c.last?.notice?.type }));
+  });
+  const state = await Promise.race([read, sleep(5000).then(() => 'no answer in 5 s: the session is busy')]);
+  const updates = await page.evaluate(() => window.__updates ?? []);
+  return `core: ${JSON.stringify(state)}\nlive updates:\n  ${updates.join('\n  ')}`;
+}
+
 async function uiEndToEnd(browser, relayBin, buildDir) {
   const dir = await mkdtemp(join(tmpdir(), 'messenger-ui-e2e-'));
   const extra = {};
@@ -563,6 +584,7 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
   errorSourceDir = resolve(buildDir);
   try {
     const alice = await openPage(browser, `${base}/`);
+    await recordUpdates(alice.page);
     let bob;
     let code;
 
@@ -583,6 +605,7 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
       code = words(node).match(codePattern)[0];
       await press(alice.page, 'Done');
       bob = await openPage(browser, `${base}/?invite=${code}`);
+      await recordUpdates(bob.page);
       await shows(bob.page, 'Welcome to Messenger');
       await typeInto(bob.page, 'Your name', 'Bob');
       await typeInto(bob.page, 'Username', 'bob');
@@ -600,7 +623,13 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
     });
 
     await test('ui: it arrives, and the reply arrives live', async () => {
-      const { handle } = await shows(bob.page, 'hello from the app');
+      let found;
+      try {
+        found = await shows(bob.page, 'hello from the app');
+      } catch (e) {
+        throw new Error(`${e.message}\n\nBob's side:\n${await engineState(bob.page)}\n\nAlice's side:\n${await engineState(alice.page)}`);
+      }
+      const { handle } = found;
       await handle.click(); // the chat in the list
       await shows(bob.page, 'Alice added you');
       await typeInto(bob.page, 'Message', 'hi alice');
