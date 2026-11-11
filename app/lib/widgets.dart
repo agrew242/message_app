@@ -158,6 +158,7 @@ Future<void> showInviteDialog(BuildContext context) async {
         ],
       ),
       actions: [
+        TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Done')),
         TextButton(
           onPressed: () async {
             await Clipboard.setData(ClipboardData(text: message));

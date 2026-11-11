@@ -527,7 +527,7 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
       const codePattern = /[0-9a-f]{5}(?:-[0-9a-f]{5}){3}/;
       const { node } = await axFind(alice.page, (n) => codePattern.test(words(n)), 'the invite code');
       code = words(node).match(codePattern)[0];
-      await alice.page.keyboard.press('Escape');
+      await press(alice.page, 'Done');
       bob = await openPage(browser, `${base}/?invite=${code}`);
       await shows(bob.page, 'Welcome to Messenger');
       await typeInto(bob.page, 'Your name', 'Bob');

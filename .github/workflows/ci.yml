@@ -90,8 +90,9 @@ jobs:
           flutter pub get
           flutter analyze --no-fatal-infos
           flutter test
-          # A build with the accessibility tree always on, for the UI test.
-          flutter build web --release --dart-define=MESSENGER_SEMANTICS=true
+          # A build with the accessibility tree always on, for the UI test
+          # (profile mode, so error stacks keep their function names).
+          flutter build web --profile --dart-define=MESSENGER_SEMANTICS=true
           mv build/web build/web-ui
           flutter build web --release
           echo "--- pubspec.lock ---"
