@@ -4,3 +4,5 @@
 *.db-shm
 .msg/
 crates/wasm/pkg/
+deploy/.env
+deploy/backups/

@@ -1,0 +1,96 @@
+name: Publish the web app
+
+# Builds the web app from this repository and publishes it with GitHub
+# Pages, on a different host from the relay (see deploy/SETUP.md). Runs on
+# every push to main, or by hand from the Actions tab.
+#
+# Repository variables (Settings > Secrets and variables > Actions):
+#   RELAY_URL  required, e.g. https://relay.example.com
+#   BASE_HREF  only without a custom domain: /message_app/
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the settings
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL }}
+        run: |
+          case "$RELAY_URL" in
+            https://*) ;;
+            *) echo "::error::Set the RELAY_URL repository variable to your relay's https:// address (Settings > Secrets and variables > Actions > Variables)."; exit 1 ;;
+          esac
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Find the wasm-bindgen version in Cargo.lock
+        id: wb
+        run: |
+          version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+      - name: Build the encryption core for the browser
+        run: |
+          cargo build -p messenger-wasm --target wasm32-unknown-unknown --profile wasm-release --locked
+          wasm-bindgen --target web --out-dir app/web/pkg \
+            target/wasm32-unknown-unknown/wasm-release/messenger_wasm.wasm
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Bundle third-party browser code
+        run: |
+          npm ci --prefix app/web_deps
+          mkdir -p app/web/messenger/vendor
+          cp app/web_deps/node_modules/jsqr/dist/jsQR.js app/web/messenger/vendor/
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.9
+          cache: true
+      - name: Build the app
+        working-directory: app
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL }}
+          BASE_HREF: ${{ vars.BASE_HREF || '/' }}
+        run: |
+          printf '{ "relay": "%s" }\n' "$RELAY_URL" > web/config.json
+          flutter pub get
+          flutter build web --release --base-href "$BASE_HREF"
+          # A list of every published file's SHA-256, so anyone can check
+          # that what the site serves is what this commit built.
+          cd build/web
+          find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          echo "Built from ${GITHUB_SHA}. SHA256SUMS:"
+          cat SHA256SUMS
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: app/build/web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

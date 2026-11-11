@@ -113,3 +113,14 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }
+
+/// Writes a consistent, compacted copy of the database at `db` to `dest`
+/// (which must not exist). Safe while the relay is running.
+pub fn backup(db: &Path, dest: &Path) -> anyhow::Result<()> {
+    let conn = Connection::open(db)?;
+    let dest = dest
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("backup path must be valid UTF-8"))?;
+    conn.execute("VACUUM INTO ?1", [dest])?;
+    Ok(())
+}

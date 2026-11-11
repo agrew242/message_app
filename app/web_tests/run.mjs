@@ -8,6 +8,9 @@
 //       WebAssembly build in web/pkg and a real relay on another origin.
 //   FLUTTER_BUILD=../build/web node run.mjs
 //       Also: the built Flutter app boots without errors.
+//   FLUTTER_UI_BUILD=../build/web-ui (with RELAY_BIN)
+//       Also: two people use the real app through its accessibility tree
+//       (a build made with --dart-define=MESSENGER_SEMANTICS=true).
 //
 // CHROME_PATH picks the browser (default: google-chrome).
 
@@ -96,6 +99,12 @@ async function openPage(browser, url) {
   const page = await context.newPage();
   page.errors = [];
   page.on('pageerror', (e) => page.errors.push(String(e)));
+  await page.evaluateOnNewDocument(() => {
+    window.__csp = [];
+    document.addEventListener('securitypolicyviolation', (e) =>
+      window.__csp.push(`${e.violatedDirective} ${e.blockedURI}`),
+    );
+  });
   page.on('console', (m) => {
     if (m.type() === 'error') console.log(`  [console] ${m.text()}`);
   });
@@ -401,6 +410,156 @@ async function endToEnd(browser, relayBin) {
       assert.deepEqual(alice.page.errors, []);
       assert.deepEqual(bob.page.errors, []);
     });
+    await alice.context.close();
+    await bob.context.close();
+  } finally {
+    relay.kill('SIGTERM');
+    server.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The real app, used through its accessibility tree
+// ---------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function axSearch(node, predicate) {
+  if (!node) return null;
+  if (predicate(node)) return node;
+  for (const child of node.children ?? []) {
+    const hit = axSearch(child, predicate);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function axDump(page) {
+  const lines = [];
+  const walk = (n, depth) => {
+    if (!n) return;
+    if (n.role !== 'none' && n.role !== 'generic' || n.name) {
+      lines.push(`${'  '.repeat(depth)}${n.role} ${JSON.stringify(n.name ?? '')}${n.value ? ` = ${JSON.stringify(n.value)}` : ''}`);
+    }
+    for (const c of n.children ?? []) walk(c, depth + 1);
+  };
+  walk(await page.accessibility.snapshot({ interestingOnly: false }), 0);
+  return lines.slice(0, 200).join('\n');
+}
+
+/** The first accessibility node matching `predicate`, as an element. */
+async function axFind(page, predicate, what, timeout = 20000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const hit = axSearch(await page.accessibility.snapshot({ interestingOnly: false }), predicate);
+    const handle = hit ? await hit.elementHandle() : null;
+    if (handle) return { node: hit, handle };
+    await sleep(250);
+  }
+  throw new Error(`${what} not found. The screen shows:\n${await axDump(page)}`);
+}
+
+const name = (n) => (n.name ?? '').trim();
+const words = (n) => [n.name, n.value, n.description].filter(Boolean).join(' ');
+const button = (page, label) => axFind(page, (n) => n.role === 'button' && name(n).startsWith(label), `button "${label}"`);
+const shows = (page, text) => axFind(page, (n) => words(n).includes(text), `"${text}"`);
+
+/** A text field by its label (or hint); else the only text field on screen. */
+async function field(page, label, timeout = 20000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    const boxes = [];
+    const walk = (n) => {
+      if (!n) return;
+      if (n.role === 'textbox') boxes.push(n);
+      for (const c of n.children ?? []) walk(c);
+    };
+    walk(await page.accessibility.snapshot({ interestingOnly: false }));
+    const hit =
+      boxes.find((n) => name(n).startsWith(label) || (n.description ?? '').trim().startsWith(label)) ??
+      (boxes.length === 1 ? boxes[0] : null);
+    const handle = hit ? await hit.elementHandle() : null;
+    if (handle) return { node: hit, handle };
+    await sleep(250);
+  }
+  throw new Error(`field "${label}" not found. The screen shows:\n${await axDump(page)}`);
+}
+
+async function typeInto(page, label, text) {
+  const { handle } = await field(page, label);
+  await handle.click();
+  await sleep(150);
+  await page.keyboard.type(text, { delay: 10 });
+  await sleep(150);
+}
+
+async function press(page, label) {
+  const { handle } = await button(page, label);
+  await handle.click();
+}
+
+async function uiEndToEnd(browser, relayBin, buildDir) {
+  const dir = await mkdtemp(join(tmpdir(), 'messenger-ui-e2e-'));
+  const extra = {};
+  const { server, base } = await serve(resolve(buildDir), extra);
+  const { relay, url, invite } = await startRelay(relayBin, dir, base);
+  extra['/config.json'] = JSON.stringify({ relay: url });
+  try {
+    const alice = await openPage(browser, `${base}/`);
+    let bob;
+    let code;
+
+    await test('ui: sign up through the screens', async () => {
+      const page = alice.page;
+      await shows(page, 'Welcome to Messenger');
+      await typeInto(page, 'Your name', 'Alice');
+      await typeInto(page, 'Username', 'alice');
+      await typeInto(page, 'Invite code', invite);
+      await press(page, 'Create account');
+      await shows(page, 'No chats yet');
+    });
+
+    await test('ui: invite a friend, who signs up from the link', async () => {
+      await press(alice.page, 'Invite a friend');
+      const codePattern = /[0-9a-f]{5}(?:-[0-9a-f]{5}){3}/;
+      const { node } = await axFind(alice.page, (n) => codePattern.test(words(n)), 'the invite code');
+      code = words(node).match(codePattern)[0];
+      await alice.page.keyboard.press('Escape');
+      bob = await openPage(browser, `${base}/?invite=${code}`);
+      await shows(bob.page, 'Welcome to Messenger');
+      await typeInto(bob.page, 'Your name', 'Bob');
+      await typeInto(bob.page, 'Username', 'bob');
+      await press(bob.page, 'Create account');
+      await shows(bob.page, 'No chats yet');
+    });
+
+    await test('ui: start a chat and send a message', async () => {
+      await press(alice.page, 'New chat');
+      await typeInto(alice.page, 'Usernames', 'bob');
+      await press(alice.page, 'Start chat');
+      await typeInto(alice.page, 'Message', 'hello from the app');
+      await press(alice.page, 'Send');
+      await shows(alice.page, 'hello from the app');
+    });
+
+    await test('ui: it arrives, and the reply arrives live', async () => {
+      const { handle } = await shows(bob.page, 'hello from the app');
+      await handle.click(); // the chat in the list
+      await shows(bob.page, 'Alice added you');
+      await typeInto(bob.page, 'Message', 'hi alice');
+      await bob.page.keyboard.press('Enter');
+      await shows(alice.page, 'hi alice');
+      await shows(alice.page, 'Seen');
+    });
+
+    await test('ui: no errors, nothing blocked', async () => {
+      for (const { page } of [alice, bob]) {
+        assert.deepEqual(page.errors, []);
+        assert.deepEqual(await page.evaluate(() => window.__csp), []);
+      }
+    });
+    await alice.context.close();
+    await bob?.context.close();
   } finally {
     relay.kill('SIGTERM');
     server.close();
@@ -425,6 +584,7 @@ async function flutterBoots(browser, buildDir) {
     assert.ok(started.ok, started.message);
     assert.equal(started.value.state, 'new');
     assert.deepEqual(page.errors, []);
+    assert.deepEqual(await page.evaluate(() => window.__csp), [], 'Content-Security-Policy blocked something');
     await context.close();
   } finally {
     server.close();
@@ -453,6 +613,9 @@ try {
 
   if (process.env.FLUTTER_BUILD) {
     await test('flutter: the built app boots', () => flutterBoots(browser, process.env.FLUTTER_BUILD));
+  }
+  if (process.env.FLUTTER_UI_BUILD && relayBin) {
+    await uiEndToEnd(browser, resolve(relayBin), process.env.FLUTTER_UI_BUILD);
   }
 } finally {
   await browser.close();

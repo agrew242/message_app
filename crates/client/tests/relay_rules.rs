@@ -399,3 +399,34 @@ async fn key_packages_can_be_replaced_wholesale() {
     assert_eq!(s, StatusCode::OK);
     assert_eq!(body["available"], 3);
 }
+
+#[tokio::test]
+async fn backups_are_complete_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("relay.db");
+    let relay = Relay::open(&db).unwrap();
+    let first = relay.bootstrap_invite().unwrap().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(messenger_relay::serve(listener, relay.clone()));
+    let http = reqwest::Client::new();
+    let alice = register(&http, &url, &first, "alice").await;
+
+    let copy = tmp.path().join("backup.db");
+    messenger_relay::db::backup(&db, &copy).unwrap();
+    assert!(messenger_relay::db::backup(&db, &copy).is_err(), "never overwrites");
+
+    // The copy has alice: no bootstrap invite, and her token still works.
+    let restored = Relay::open(&copy).unwrap();
+    assert!(restored.bootstrap_invite().unwrap().is_none());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url2 = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(messenger_relay::serve(listener, restored));
+    let res = http
+        .get(format!("{url2}/v1/mailbox"))
+        .bearer_auth(&alice.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}

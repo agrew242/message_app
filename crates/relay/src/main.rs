@@ -9,20 +9,36 @@
 //! - `RELAY_VAPID_SUBJECT` — contact for push services, e.g.
 //!   `mailto:you@example.com`.
 //! - `RUST_LOG`   — log filter (default `info`).
+//!
+//! `messenger-relay backup <file>` writes a consistent copy of the database
+//! to `<file>`, even while the relay is running.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use anyhow::{bail, Context};
 use messenger_relay::{serve, Relay, RelayConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let db_path = PathBuf::from(std::env::var("RELAY_DB").unwrap_or_else(|_| "relay.db".into()));
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        None => {}
+        Some("backup") => {
+            let dest = args.next().context("usage: messenger-relay backup <file>")?;
+            messenger_relay::db::backup(&db_path, Path::new(&dest))?;
+            println!("Backed up {} to {dest}", db_path.display());
+            return Ok(());
+        }
+        Some(other) => bail!("unknown command {other:?}; run with no arguments, or `backup <file>`"),
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     let addr = std::env::var("RELAY_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let db_path = PathBuf::from(std::env::var("RELAY_DB").unwrap_or_else(|_| "relay.db".into()));
 
     let relay = Relay::open_with(&db_path, RelayConfig::from_env())?;
     if let Some(code) = relay.bootstrap_invite()? {
