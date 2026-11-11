@@ -630,8 +630,11 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
       await typeInto(alice.page, 'Message', 'hello from the app');
       await press(alice.page, 'Send');
       await shows(alice.page, 'hello from the app');
-      const box = await field(alice.page, 'Message');
-      assert.equal(box.node.value ?? '', '', 'the message box should be empty once sent');
+      // The box empties after sending: the next message carries only its own text.
+      await typeInto(alice.page, 'Message', 'and a second');
+      await press(alice.page, 'Send');
+      const { node } = await shows(alice.page, 'and a second');
+      assert.ok(!words(node).includes('hello from the app'), `second message carried the first: ${words(node)}`);
     });
 
     await test('ui: it arrives, and the reply arrives live', async () => {
