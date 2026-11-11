@@ -297,11 +297,21 @@ pub fn router(relay: Arc<Relay>) -> Router {
         )
         .route("/v1/blobs/{blob_id}", get(download_blob))
         .layer(middleware::from_fn(log_requests))
+        .layer(middleware::from_fn(no_store))
         .with_state(relay);
     match cors {
         Some(cors) => router.layer(cors),
         None => router,
     }
+}
+
+/// Nothing the relay says should sit in a browser or proxy cache.
+async fn no_store(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    res.headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    res
 }
 
 /// Lets the web app, served from its own origin, call the API.

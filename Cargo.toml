@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/core", "crates/session", "crates/relay", "crates/client"]
+members = ["crates/protocol", "crates/core", "crates/session", "crates/relay", "crates/client", "crates/wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -27,3 +27,11 @@ messenger-protocol = { path = "crates/protocol" }
 messenger-core = { path = "crates/core" }
 messenger-session = { path = "crates/session" }
 messenger-relay = { path = "crates/relay" }
+
+# Small and fast WebAssembly for the web app:
+#   cargo build -p messenger-wasm --target wasm32-unknown-unknown --profile wasm-release
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1

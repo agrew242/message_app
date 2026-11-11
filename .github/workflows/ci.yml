@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main, phase-1]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (format, lints, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  wasm:
+    name: WebAssembly build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Find the wasm-bindgen version in Cargo.lock
+        id: wb
+        run: |
+          version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+      - name: Build the WebAssembly module
+        run: |
+          cargo build -p messenger-wasm --target wasm32-unknown-unknown --profile wasm-release --locked
+          wasm-bindgen --target web --out-dir crates/wasm/pkg \
+            target/wasm32-unknown-unknown/wasm-release/messenger_wasm.wasm
+          ls -la crates/wasm/pkg
+      - run: cargo build -p messenger-relay --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Smoke test against a real relay
+        run: node crates/wasm/smoke.mjs target/debug/messenger-relay
+      - uses: actions/upload-artifact@v4
+        with:
+          name: messenger-wasm
+          path: crates/wasm/pkg

@@ -109,6 +109,8 @@ async fn relay_enforces_epochs_membership_and_auth() {
     // No token, no access.
     let res = http.get(format!("{url}/v1/mailbox")).send().await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    // And nothing the relay says is cacheable.
+    assert_eq!(res.headers()["cache-control"], "no-store");
 
     let chat = "00112233445566778899aabbccddeeff";
     let commits = format!("/v1/chats/{chat}/commits");

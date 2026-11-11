@@ -244,7 +244,8 @@ pub enum VerifyOutcome {
 /// What happened while processing mail from the relay.
 // Events are few and short-lived, so a big `Message` variant costs nothing.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     JoinedChat {
         chat_id: String,

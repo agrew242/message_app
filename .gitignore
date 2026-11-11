@@ -3,3 +3,4 @@
 *.db-wal
 *.db-shm
 .msg/
+crates/wasm/pkg/
