@@ -70,6 +70,28 @@ CREATE TABLE IF NOT EXISTS mailbox (
 );
 CREATE INDEX IF NOT EXISTS mailbox_by_device ON mailbox(device_id, id);
 CREATE INDEX IF NOT EXISTS mailbox_by_age ON mailbox(created_at);
+
+-- Where to send a device's content-free wake-up pushes.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    device_id   TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+    endpoint    TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+-- Encrypted attachments (photos). The key is inside the message, never here.
+CREATE TABLE IF NOT EXISTS blobs (
+    id          TEXT PRIMARY KEY,
+    uploader    TEXT REFERENCES devices(id) ON DELETE SET NULL,
+    data        BLOB NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS blobs_by_age ON blobs(created_at);
+
+-- The relay's own keys, such as its VAPID key for web push.
+CREATE TABLE IF NOT EXISTS server_keys (
+    name        TEXT PRIMARY KEY,
+    value       BLOB NOT NULL
+);
 "#;
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {

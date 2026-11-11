@@ -23,5 +23,7 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 messenger-relay.workspace = true
 tempfile = "3"
+tokio-tungstenite = "0.30"

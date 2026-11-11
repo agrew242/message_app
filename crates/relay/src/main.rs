@@ -4,11 +4,15 @@
 //! - `RELAY_ADDR` — address to listen on (default `127.0.0.1:8080`). Put it
 //!   behind Caddy or another TLS proxy in production; never expose plain HTTP.
 //! - `RELAY_DB`   — SQLite file (default `relay.db`).
+//! - `RELAY_ALLOWED_ORIGINS` — comma-separated web app origins allowed to
+//!   call the API from a browser, e.g. `https://app.example.com`.
+//! - `RELAY_VAPID_SUBJECT` — contact for push services, e.g.
+//!   `mailto:you@example.com`.
 //! - `RUST_LOG`   — log filter (default `info`).
 
 use std::path::PathBuf;
 
-use messenger_relay::{serve, Relay};
+use messenger_relay::{serve, Relay, RelayConfig};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -20,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("RELAY_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let db_path = PathBuf::from(std::env::var("RELAY_DB").unwrap_or_else(|_| "relay.db".into()));
 
-    let relay = Relay::open(&db_path)?;
+    let relay = Relay::open_with(&db_path, RelayConfig::from_env())?;
     if let Some(code) = relay.bootstrap_invite()? {
         println!("No users yet. First invite code (valid 7 days): {code}");
     }
