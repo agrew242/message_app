@@ -489,8 +489,18 @@ async function axFind(page, predicate, what, timeout = 20000) {
 
 const name = (n) => (n.name ?? '').trim();
 const words = (n) => [n.name, n.value, n.description].filter(Boolean).join(' ');
-const button = (page, label) => axFind(page, (n) => n.role === 'button' && name(n).startsWith(label), `button "${label}"`);
-const shows = (page, text) => axFind(page, (n) => words(n).includes(text), `"${text}"`);
+/** A button by its exact name, else one whose name starts with it. */
+async function button(page, label) {
+  try {
+    return await axFind(page, (n) => n.role === 'button' && name(n) === label, `button "${label}"`, 3000);
+  } catch {
+    return axFind(page, (n) => n.role === 'button' && name(n).startsWith(label), `button "${label}"`);
+  }
+}
+
+/** Text on screen (not text still waiting in a text field). */
+const shows = (page, text) =>
+  axFind(page, (n) => n.role !== 'textbox' && words(n).includes(text), `"${text}"`);
 
 /** A text field by its label (or hint). */
 async function field(page, label, timeout = 20000) {
@@ -620,6 +630,8 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
       await typeInto(alice.page, 'Message', 'hello from the app');
       await press(alice.page, 'Send');
       await shows(alice.page, 'hello from the app');
+      const box = await field(alice.page, 'Message');
+      assert.equal(box.node.value ?? '', '', 'the message box should be empty once sent');
     });
 
     await test('ui: it arrives, and the reply arrives live', async () => {
