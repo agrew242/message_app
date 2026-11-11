@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, readFile, readdir, stat } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
@@ -93,6 +93,30 @@ async function test(name, fn) {
   }
 }
 
+/** Where main.dart.js lives, to show the code around an uncaught error. */
+let errorSourceDir = null;
+const shownSources = new Set();
+
+function showSource(stack) {
+  if (!errorSourceDir) return;
+  const frames = [...String(stack).matchAll(/main\.dart\.js:(\d+):(\d+)/g)].slice(0, 4);
+  let lines;
+  try {
+    lines = readFileSync(join(errorSourceDir, 'main.dart.js'), 'utf8').split('\n');
+  } catch {
+    return;
+  }
+  for (const [, line] of frames) {
+    if (shownSources.has(line)) continue;
+    shownSources.add(line);
+    const n = Number(line);
+    console.log(`  --- main.dart.js:${n} ---`);
+    for (let i = Math.max(1, n - 8); i <= Math.min(lines.length, n + 3); i++) {
+      console.log(`  ${i === n ? '>' : ' '} ${lines[i - 1].slice(0, 160)}`);
+    }
+  }
+}
+
 /** A fresh browser profile on `url`, with page errors collected. */
 async function openPage(browser, url) {
   const context = await browser.createBrowserContext();
@@ -101,6 +125,7 @@ async function openPage(browser, url) {
   page.on('pageerror', (e) => {
     page.errors.push(String(e));
     console.log(`  [pageerror] ${e?.stack ?? e}`);
+    showSource(e?.stack ?? '');
   });
   await page.evaluateOnNewDocument(() => {
     window.__csp = [];
@@ -493,7 +518,18 @@ async function typeInto(page, label, text) {
   await handle.click();
   await sleep(150);
   await page.keyboard.type(text, { delay: 10 });
-  await sleep(150);
+  await sleep(250);
+  const focused = await page.evaluate(() => {
+    const el = document.activeElement;
+    return { tag: el?.tagName, value: el?.value ?? null };
+  });
+  if (!String(focused.value ?? '').includes(text)) {
+    const now = await field(page, label);
+    throw new Error(
+      `typing into "${label}" didn't stick: focus is on <${focused.tag}> holding ${JSON.stringify(focused.value)}; ` +
+        `the field reads ${JSON.stringify(now.node.value ?? '')}`,
+    );
+  }
 }
 
 async function press(page, label) {
@@ -507,6 +543,7 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
   const { server, base } = await serve(resolve(buildDir), extra);
   const { relay, url, invite } = await startRelay(relayBin, dir, base);
   extra['/config.json'] = JSON.stringify({ relay: url });
+  errorSourceDir = resolve(buildDir);
   try {
     const alice = await openPage(browser, `${base}/`);
     let bob;
