@@ -151,7 +151,7 @@ Future<void> showInviteDialog(BuildContext context) async {
         children: [
           const Text('Send this to a friend. The code works once, within 7 days.'),
           const SizedBox(height: 16),
-          SelectableText(
+          Text(
             code,
             style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600, letterSpacing: 1.5, fontFamily: 'monospace'),
           ),

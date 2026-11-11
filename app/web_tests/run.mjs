@@ -98,7 +98,10 @@ async function openPage(browser, url) {
   const context = await browser.createBrowserContext();
   const page = await context.newPage();
   page.errors = [];
-  page.on('pageerror', (e) => page.errors.push(String(e)));
+  page.on('pageerror', (e) => {
+    page.errors.push(String(e));
+    console.log(`  [pageerror] ${e?.stack ?? e}`);
+  });
   await page.evaluateOnNewDocument(() => {
     window.__csp = [];
     document.addEventListener('securitypolicyviolation', (e) =>
