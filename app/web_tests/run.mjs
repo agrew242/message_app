@@ -533,9 +533,20 @@ async function typeInto(page, label, text) {
   });
   if (!String(focused.value ?? '').includes(text)) {
     const now = await field(page, label);
+    const dom = await handle.evaluate((el) => {
+      const describe = (n) => n.outerHTML.replace(/>[^<]{40,}</g, '>…<').slice(0, 1500);
+      return {
+        node: describe(el),
+        parent: el.parentElement ? describe(el.parentElement) : null,
+        editors: [...document.querySelectorAll('input, textarea, [contenteditable]')].map(
+          (e) => `${e.tagName} in <${e.parentElement?.tagName}> ${e.getAttribute('aria-label') ?? ''}`,
+        ),
+      };
+    });
     throw new Error(
       `typing into "${label}" didn't stick: focus is on <${focused.tag}> holding ${JSON.stringify(focused.value)}; ` +
-        `the field reads ${JSON.stringify(now.node.value ?? '')}`,
+        `the field reads ${JSON.stringify(now.node.value ?? '')}\n` +
+        `node: ${dom.node}\nparent: ${dom.parent}\neditors on the page: ${JSON.stringify(dom.editors)}`,
     );
   }
 }
