@@ -492,7 +492,7 @@ const words = (n) => [n.name, n.value, n.description].filter(Boolean).join(' ');
 const button = (page, label) => axFind(page, (n) => n.role === 'button' && name(n).startsWith(label), `button "${label}"`);
 const shows = (page, text) => axFind(page, (n) => words(n).includes(text), `"${text}"`);
 
-/** A text field by its label (or hint); else the only text field on screen. */
+/** A text field by its label (or hint). */
 async function field(page, label, timeout = 20000) {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
@@ -503,9 +503,7 @@ async function field(page, label, timeout = 20000) {
       for (const c of n.children ?? []) walk(c);
     };
     walk(await page.accessibility.snapshot({ interestingOnly: false }));
-    const hit =
-      boxes.find((n) => name(n).startsWith(label) || (n.description ?? '').trim().startsWith(label)) ??
-      (boxes.length === 1 ? boxes[0] : null);
+    const hit = boxes.find((n) => name(n).startsWith(label) || (n.description ?? '').trim().startsWith(label));
     const handle = hit ? await hit.elementHandle() : null;
     if (handle) return { node: hit, handle };
     await sleep(250);
