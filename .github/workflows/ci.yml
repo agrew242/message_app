@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main, phase-1]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (format, lints, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  wasm:
+    name: WebAssembly build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Find the wasm-bindgen version in Cargo.lock
+        id: wb
+        run: |
+          version=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ steps.wb.outputs.version }}
+      - name: Build the WebAssembly module
+        run: |
+          cargo build -p messenger-wasm --target wasm32-unknown-unknown --profile wasm-release --locked
+          wasm-bindgen --target web --out-dir crates/wasm/pkg \
+            target/wasm32-unknown-unknown/wasm-release/messenger_wasm.wasm
+          ls -la crates/wasm/pkg
+      - run: cargo build -p messenger-relay --locked
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Smoke test against a real relay
+        run: node crates/wasm/smoke.mjs target/debug/messenger-relay
+      - uses: actions/upload-artifact@v7
+        with:
+          name: messenger-wasm
+          path: crates/wasm/pkg
+
+  web:
+    name: Web app build and browser tests
+    needs: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: messenger-wasm
+          path: app/web/pkg
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p messenger-relay --locked
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Bundle third-party browser code
+        run: |
+          npm ci --prefix app/web_deps
+          mkdir -p app/web/messenger/vendor
+          cp app/web_deps/node_modules/jsqr/dist/jsQR.js app/web/messenger/vendor/
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: 3.47.9
+          cache: true
+      - name: Analyze, test and build the Flutter app
+        working-directory: app
+        run: |
+          flutter --version
+          flutter pub get
+          flutter analyze --no-fatal-infos
+          flutter test
+          # A build with the accessibility tree always on, for the UI test
+          # (profile mode, so error stacks keep their function names).
+          flutter build web --profile --dart-define=MESSENGER_SEMANTICS=true
+          mv build/web build/web-ui
+          flutter build web --release
+          echo "--- pubspec.lock ---"
+          cat pubspec.lock
+      - name: Browser tests in Chrome (storage, photos, end to end, app boot)
+        working-directory: app/web_tests
+        run: |
+          npm ci
+          RELAY_BIN=../../target/debug/messenger-relay FLUTTER_BUILD=../build/web FLUTTER_UI_BUILD=../build/web-ui node run.mjs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: messenger-web
+          path: app/build/web
+
+  deploy-kit:
+    name: Relay container and Caddy config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compose file and Caddyfile are valid
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          docker compose config --quiet
+          docker run --rm -e RELAY_DOMAIN=relay.example.com -e CONTACT_EMAIL=you@example.com \
+            -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2 \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Build the relay image
+        run: docker build -f deploy/Dockerfile -t messenger-relay .
+      - name: The container runs, answers, and backs up
+        run: |
+          docker volume create relay-data
+          docker run -d --name relay -p 8080:8080 -v relay-data:/data messenger-relay
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/healthz && break; sleep 1; done
+          echo
+          docker logs relay 2>&1 | grep -q "First invite code"
+          docker exec relay messenger-relay backup /data/backup.db
+          docker exec relay ls -l /data
+          docker rm -f relay

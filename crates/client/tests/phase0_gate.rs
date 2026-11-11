@@ -10,8 +10,7 @@
 
 use std::path::Path;
 
-use messenger_client::Client;
-use messenger_core::Event;
+use messenger_client::{open, register, Client, Event};
 use messenger_relay::Relay;
 use tokio::net::TcpListener;
 
@@ -54,11 +53,12 @@ fn assert_no_drops(who: &str, events: &[Event]) {
 fn assert_in_sync(chat: &str, clients: &[&Client]) {
     let first = clients[0];
     for c in &clients[1..] {
-        assert_eq!(first.members(chat).unwrap(), c.members(chat).unwrap(), "members differ");
-        assert_eq!(first.epoch(chat).unwrap(), c.epoch(chat).unwrap(), "epochs differ");
+        let (a, b) = (first.engine(), c.engine());
+        assert_eq!(a.members(chat).unwrap(), b.members(chat).unwrap(), "members differ");
+        assert_eq!(a.epoch(chat).unwrap(), b.epoch(chat).unwrap(), "epochs differ");
         assert_eq!(
-            first.epoch_authenticator(chat).unwrap(),
-            c.epoch_authenticator(chat).unwrap(),
+            a.epoch_authenticator(chat).unwrap(),
+            b.epoch_authenticator(chat).unwrap(),
             "group state differs"
         );
     }
@@ -74,11 +74,7 @@ fn file_contains(path: &Path, needle: &str) -> bool {
 /// Searches the relay database, its write-ahead log, and every device's
 /// saved state for message text.
 fn assert_no_plaintext_on_disk(tmp: &Path) {
-    let mut files = vec![
-        tmp.join("relay.db"),
-        tmp.join("relay.db-wal"),
-        tmp.join("relay.db-shm"),
-    ];
+    let mut files = vec![tmp.join("relay.db"), tmp.join("relay.db-wal"), tmp.join("relay.db-shm")];
     for device in ["alice", "bob", "carol"] {
         files.push(tmp.join(device).join("state.bin"));
     }
@@ -100,14 +96,18 @@ async fn three_clients_stay_in_sync_and_the_relay_sees_no_plaintext() {
     let (url, first_invite, relay) = start_relay(tmp).await;
 
     // --- Sign-up: alice uses the first invite, then invites her friends.
-    let mut alice = Client::register(&url, &tmp.join("alice"), &first_invite, "alice").await.unwrap();
+    let mut alice = register(&url, &tmp.join("alice"), &first_invite, "alice")
+        .await
+        .unwrap();
     let bob_invite = alice.invite().await.unwrap();
     let carol_invite = alice.invite().await.unwrap();
-    let mut bob = Client::register(&url, &tmp.join("bob"), &bob_invite, "bob").await.unwrap();
-    let mut carol = Client::register(&url, &tmp.join("carol"), &carol_invite, "carol").await.unwrap();
+    let mut bob = register(&url, &tmp.join("bob"), &bob_invite, "bob").await.unwrap();
+    let mut carol = register(&url, &tmp.join("carol"), &carol_invite, "carol")
+        .await
+        .unwrap();
 
     // An invite works only once.
-    let reuse = Client::register(&url, &tmp.join("mallory"), &bob_invite, "mallory").await;
+    let reuse = register(&url, &tmp.join("mallory"), &bob_invite, "mallory").await;
     assert!(reuse.is_err(), "a used invite code was accepted again");
 
     // --- Alice starts a group chat with bob and carol.
@@ -116,18 +116,23 @@ async fn three_clients_stay_in_sync_and_the_relay_sees_no_plaintext() {
         let events = client.sync().await.unwrap();
         assert_no_drops(name, &events);
         assert!(
-            events.iter().any(|e| matches!(e, Event::JoinedChat { chat_id, .. } if *chat_id == chat)),
+            events
+                .iter()
+                .any(|e| matches!(e, Event::JoinedChat { chat_id, .. } if *chat_id == chat)),
             "{name} didn't join: {events:?}"
         );
     }
     assert_in_sync(&chat, &[&alice, &bob, &carol]);
-    assert_eq!(alice.members(&chat).unwrap().len(), 3);
+    assert_eq!(alice.engine().members(&chat).unwrap().len(), 3);
 
     // --- Messages flow both ways.
-    alice.send(&chat, CANARIES[0]).await.unwrap();
+    alice.send_text(&chat, CANARIES[0]).await.unwrap();
 
     // While the message waits on the relay, the relay holds only ciphertext.
-    assert!(relay.pending_mail().unwrap() >= 2, "expected mail waiting for bob and carol");
+    assert!(
+        relay.pending_mail().unwrap() >= 2,
+        "expected mail waiting for bob and carol"
+    );
     assert_no_plaintext_on_disk(tmp);
 
     let bob_events = bob.sync().await.unwrap();
@@ -135,45 +140,57 @@ async fn three_clients_stay_in_sync_and_the_relay_sees_no_plaintext() {
     assert_eq!(bodies_from(&bob_events, "alice/"), vec![CANARIES[0]]);
     assert_eq!(bodies_from(&carol_events, "alice/"), vec![CANARIES[0]]);
 
-    bob.send(&chat, CANARIES[1]).await.unwrap();
+    bob.send_text(&chat, CANARIES[1]).await.unwrap();
     assert_eq!(bodies_from(&alice.sync().await.unwrap(), "bob/"), vec![CANARIES[1]]);
     assert_eq!(bodies_from(&carol.sync().await.unwrap(), "bob/"), vec![CANARIES[1]]);
 
     // --- Carol's device restarts and carries on from its saved state.
     let carol_dir = tmp.join("carol");
     drop(carol);
-    let mut carol = Client::open(&carol_dir).unwrap();
-    let history: Vec<String> = carol.history(&chat).into_iter().map(|m| m.body).collect();
+    let mut carol = open(&carol_dir).unwrap();
+    let history: Vec<String> = carol
+        .engine()
+        .history(&chat)
+        .into_iter()
+        .filter(|m| m.notice.is_none())
+        .map(|m| m.body)
+        .collect();
     assert_eq!(history, vec![CANARIES[0], CANARIES[1]], "carol lost history on restart");
-    carol.send(&chat, CANARIES[2]).await.unwrap();
+    carol.send_text(&chat, CANARIES[2]).await.unwrap();
     assert_eq!(bodies_from(&alice.sync().await.unwrap(), "carol/"), vec![CANARIES[2]]);
     assert_eq!(bodies_from(&bob.sync().await.unwrap(), "carol/"), vec![CANARIES[2]]);
     assert_in_sync(&chat, &[&alice, &bob, &carol]);
 
     // --- Bob rotates his keys (post-compromise security).
-    let before = alice.epoch(&chat).unwrap();
+    let before = alice.engine().epoch(&chat).unwrap();
     bob.rotate_keys(&chat).await.unwrap();
     for (name, client) in [("alice", &mut alice), ("carol", &mut carol)] {
         let events = client.sync().await.unwrap();
         assert_no_drops(name, &events);
         assert!(
-            events.iter().any(|e| matches!(e, Event::KeysUpdated { by, .. } if by.starts_with("bob/"))),
+            events
+                .iter()
+                .any(|e| matches!(e, Event::KeysUpdated { by, .. } if by.starts_with("bob/"))),
             "{name} missed bob's key update: {events:?}"
         );
     }
-    assert_eq!(alice.epoch(&chat).unwrap(), before + 1);
+    assert_eq!(alice.engine().epoch(&chat).unwrap(), before + 1);
     assert_in_sync(&chat, &[&alice, &bob, &carol]);
-    alice.send(&chat, CANARIES[3]).await.unwrap();
+    alice.send_text(&chat, CANARIES[3]).await.unwrap();
     assert_eq!(bodies_from(&bob.sync().await.unwrap(), "alice/"), vec![CANARIES[3]]);
     assert_eq!(bodies_from(&carol.sync().await.unwrap(), "alice/"), vec![CANARIES[3]]);
 
     // --- A commit race: alice and carol both rotate from the same epoch.
     // Alice wins; carol's commit is refused, she catches up and retries.
-    let race_epoch = alice.epoch(&chat).unwrap();
+    let race_epoch = alice.engine().epoch(&chat).unwrap();
     alice.rotate_keys(&chat).await.unwrap();
-    assert_eq!(carol.epoch(&chat).unwrap(), race_epoch, "carol should still be behind");
+    assert_eq!(
+        carol.engine().epoch(&chat).unwrap(),
+        race_epoch,
+        "carol should still be behind"
+    );
     carol.rotate_keys(&chat).await.unwrap();
-    assert_eq!(carol.epoch(&chat).unwrap(), race_epoch + 2);
+    assert_eq!(carol.engine().epoch(&chat).unwrap(), race_epoch + 2);
     assert_no_drops("alice", &alice.sync().await.unwrap());
     assert_no_drops("bob", &bob.sync().await.unwrap());
     assert_in_sync(&chat, &[&alice, &bob, &carol]);
@@ -181,7 +198,7 @@ async fn three_clients_stay_in_sync_and_the_relay_sees_no_plaintext() {
     // --- A send on a stale epoch: bob rotates, alice sends without syncing.
     // The relay refuses the stale ciphertext; alice catches up and re-sends.
     bob.rotate_keys(&chat).await.unwrap();
-    alice.send(&chat, CANARIES[4]).await.unwrap();
+    alice.send_text(&chat, CANARIES[4]).await.unwrap();
     assert_eq!(bodies_from(&bob.sync().await.unwrap(), "alice/"), vec![CANARIES[4]]);
     assert_eq!(bodies_from(&carol.sync().await.unwrap(), "alice/"), vec![CANARIES[4]]);
     assert_in_sync(&chat, &[&alice, &bob, &carol]);
@@ -190,7 +207,9 @@ async fn three_clients_stay_in_sync_and_the_relay_sees_no_plaintext() {
     alice.remove_members(&chat, &["carol"]).await.unwrap();
     let bob_events = bob.sync().await.unwrap();
     assert!(
-        bob_events.iter().any(|e| matches!(e, Event::MembersChanged { removed, .. } if removed.iter().any(|r| r.starts_with("carol/")))),
+        bob_events.iter().any(
+            |e| matches!(e, Event::MembersChanged { removed, .. } if removed.iter().any(|r| r.starts_with("carol/")))
+        ),
         "bob didn't see carol leave: {bob_events:?}"
     );
     let carol_events = carol.sync().await.unwrap();
@@ -199,22 +218,30 @@ async fn three_clients_stay_in_sync_and_the_relay_sees_no_plaintext() {
         "carol wasn't told she was removed: {carol_events:?}"
     );
     assert_in_sync(&chat, &[&alice, &bob]);
-    assert_eq!(alice.members(&chat).unwrap().len(), 2);
+    assert_eq!(alice.engine().members(&chat).unwrap().len(), 2);
 
     // After removal, carol gets nothing and can't send.
-    alice.send(&chat, CANARIES[5]).await.unwrap();
+    alice.send_text(&chat, CANARIES[5]).await.unwrap();
     assert_eq!(bodies_from(&bob.sync().await.unwrap(), "alice/"), vec![CANARIES[5]]);
     let carol_after = carol.sync().await.unwrap();
-    assert!(bodies_from(&carol_after, "").is_empty(), "removed member still got: {carol_after:?}");
-    assert!(carol.send(&chat, "should fail").await.is_err());
+    assert!(
+        bodies_from(&carol_after, "").is_empty(),
+        "removed member still got: {carol_after:?}"
+    );
+    assert!(carol.send_text(&chat, "should fail").await.is_err());
 
     // --- The gate: delivered mail is gone, and no plaintext is on disk.
+    // (Bob's last sync sent alice a delivery receipt; she collects it.)
+    assert_no_drops("alice", &alice.sync().await.unwrap());
     assert_eq!(relay.pending_mail().unwrap(), 0, "delivered mail wasn't deleted");
     assert_no_plaintext_on_disk(tmp);
 
     // Sanity check that the scan can find text at all: usernames are stored
     // in plaintext on the relay by design, so the scan must see them.
-    let relay_files_mention_bob = file_contains(&tmp.join("relay.db"), "bob")
-        || file_contains(&tmp.join("relay.db-wal"), "bob");
-    assert!(relay_files_mention_bob, "the plaintext scan isn't reading the relay files");
+    let relay_files_mention_bob =
+        file_contains(&tmp.join("relay.db"), "bob") || file_contains(&tmp.join("relay.db-wal"), "bob");
+    assert!(
+        relay_files_mention_bob,
+        "the plaintext scan isn't reading the relay files"
+    );
 }

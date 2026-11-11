@@ -1,0 +1,12 @@
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock.bak
+# Built by CI from crates/wasm and copied in before `flutter build web`.
+web/pkg/
+# Copied from node_modules (see web_deps/).
+web/messenger/vendor/
+web_deps/node_modules/
+web_tests/node_modules/

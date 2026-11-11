@@ -1,6 +1,6 @@
 [package]
 name = "messenger-client"
-description = "Native client: talks to the relay over HTTP, keeps state encrypted on disk, and drives the encryption core. Used by the command-line tool and the Phase 0 tests."
+description = "Native client: the shared session with HTTP through reqwest and state kept encrypted in a folder. Used by the `msg` command-line tool and the end-to-end tests."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -12,16 +12,17 @@ path = "src/main.rs"
 [dependencies]
 aes-gcm = "0.10"
 anyhow.workspace = true
-base64.workspace = true
 clap = { version = "4", features = ["derive"] }
-messenger-core.workspace = true
-messenger-protocol.workspace = true
+messenger-session.workspace = true
 rand.workspace = true
-reqwest = { version = "0.13", features = ["json"] }
-serde.workspace = true
-serde_json.workspace = true
+reqwest = { version = "0.13" }
 tokio.workspace = true
 
 [dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+messenger-protocol.workspace = true
 messenger-relay.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
+serde_json.workspace = true
 tempfile = "3"
+tokio-tungstenite = "0.30"
