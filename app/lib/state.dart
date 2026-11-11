@@ -214,8 +214,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   @override
-  void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
-    _foreground = lifecycle == AppLifecycleState.resumed;
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _foreground = state == AppLifecycleState.resumed;
     if (!_foreground || phase != Phase.ready) return;
     backend.syncNow();
     final open = openChatId;

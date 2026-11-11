@@ -101,7 +101,7 @@ class Root extends StatelessWidget {
         return const _Message(
           icon: Icons.tab,
           title: 'Open in another tab',
-          body: "Messenger is already open in another tab or window. Use that one, or close it and reload this page.",
+          body: 'Messenger is already open in another tab or window. Use that one, or close it and reload this page.',
         );
       case Phase.unsupported:
         return const _Message(

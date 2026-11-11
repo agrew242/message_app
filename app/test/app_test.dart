@@ -181,8 +181,23 @@ class FakeBackend implements Backend {
   Future<void> wipe() async {}
 }
 
+/// An iPhone-sized screen (390 x 844 points).
+void _phone(WidgetTester tester) {
+  tester.view.physicalSize = const Size(1170, 2532);
+  tester.view.devicePixelRatio = 3.0;
+  addTearDown(tester.view.reset);
+}
+
+Future<void> _tap(WidgetTester tester, Finder finder) async {
+  await tester.ensureVisible(finder);
+  await tester.pumpAndSettle();
+  await tester.tap(finder);
+  await tester.pumpAndSettle();
+}
+
 void main() {
   testWidgets('signing up lands on an empty chat list', (tester) async {
+    _phone(tester);
     final backend = FakeBackend(state: 'new');
     await tester.pumpWidget(MessengerApp(backend: backend));
     await tester.pumpAndSettle();
@@ -191,8 +206,7 @@ void main() {
     await tester.enterText(find.widgetWithText(TextField, 'Your name'), 'Alice');
     await tester.enterText(find.widgetWithText(TextField, 'Username'), 'Alice');
     await tester.enterText(find.widgetWithText(TextField, 'Invite code'), ' CODE1 ');
-    await tester.tap(find.text('Create account'));
-    await tester.pumpAndSettle();
+    await _tap(tester, find.text('Create account'));
 
     expect(backend.calls, contains('register alice CODE1 https://relay.test'));
     expect(backend.calls, contains('name Alice'));
@@ -200,18 +214,19 @@ void main() {
   });
 
   testWidgets('bad usernames are caught before anything is sent', (tester) async {
+    _phone(tester);
     final backend = FakeBackend(state: 'new');
     await tester.pumpWidget(MessengerApp(backend: backend));
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Username'), 'no spaces allowed');
     await tester.enterText(find.widgetWithText(TextField, 'Invite code'), 'CODE1');
-    await tester.tap(find.text('Create account'));
-    await tester.pumpAndSettle();
+    await _tap(tester, find.text('Create account'));
     expect(find.textContaining('Usernames are 3 to 32'), findsOneWidget);
     expect(backend.registered, isFalse);
   });
 
   testWidgets('a wrong PIN is refused and the right one unlocks', (tester) async {
+    _phone(tester);
     final backend = FakeBackend(state: 'locked', pin: '123456');
     await tester.pumpWidget(MessengerApp(backend: backend));
     await tester.pumpAndSettle();
@@ -229,6 +244,7 @@ void main() {
   });
 
   testWidgets('chats show previews, open, mark read and send', (tester) async {
+    _phone(tester);
     final backend = FakeBackend()
       ..messages.addAll([
         _msg('n0', '', minutesAgo: 30, notice: {'type': 'joined', 'members': [_alice, _bob]}),
@@ -249,9 +265,9 @@ void main() {
     expect(find.text('hi alice'), findsOneWidget);
 
     await tester.enterText(find.widgetWithText(TextField, 'Message'), 'hey bob');
+    await tester.pump(); // the Send button wakes up once there's text
     expect(backend.calls, contains('typing'));
-    await tester.tap(find.byTooltip('Send'));
-    await tester.pumpAndSettle();
+    await _tap(tester, find.byTooltip('Send'));
     expect(backend.calls, contains('send hey bob'));
     expect(find.text('hey bob'), findsOneWidget);
     expect(find.text('Delivered'), findsOneWidget);
@@ -264,6 +280,7 @@ void main() {
   });
 
   testWidgets('a changed security code is announced', (tester) async {
+    _phone(tester);
     final backend = FakeBackend()..messages.add(_msg('m0', 'hello'));
     await tester.pumpWidget(MessengerApp(backend: backend));
     await tester.pumpAndSettle();
@@ -275,17 +292,17 @@ void main() {
   });
 
   testWidgets('the verify screen shows a code and the safety number', (tester) async {
+    _phone(tester);
     final backend = FakeBackend()..messages.add(_msg('m0', 'hello'));
     await tester.pumpWidget(MessengerApp(backend: backend));
     await tester.pumpAndSettle();
-    await tester.tap(find.text('Bobby'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byTooltip('Chat details'));
-    await tester.pumpAndSettle();
-    await tester.tap(find.text('@bob · not verified'));
-    await tester.pumpAndSettle();
+    await _tap(tester, find.text('Bobby'));
+    await _tap(tester, find.byTooltip('Chat details'));
+    await _tap(tester, find.text('@bob · not verified'));
     expect(find.text('Verify Bobby'), findsOneWidget);
+    final matchButton = find.text('We compared: the numbers match');
+    await tester.scrollUntilVisible(matchButton, 200, scrollable: find.byType(Scrollable).first);
     expect(find.textContaining('12345  12345  12345  12345'), findsOneWidget);
-    expect(find.text('We compared: the numbers match'), findsOneWidget);
+    expect(matchButton, findsOneWidget);
   });
 }

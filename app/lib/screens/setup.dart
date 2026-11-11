@@ -187,7 +187,7 @@ class _InstallTip extends StatelessWidget {
           Expanded(
             child: Text(
               'On iPhone, first tap Share, then "Add to Home Screen", and open Messenger from your Home Screen. '
-              "Your account lives in whichever one you sign up in, and only the Home Screen app can notify you.",
+              'Your account lives in whichever one you sign up in, and only the Home Screen app can notify you.',
               style: TextStyle(color: scheme.onSecondaryContainer),
             ),
           ),
