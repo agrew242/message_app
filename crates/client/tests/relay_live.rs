@@ -82,9 +82,16 @@ async fn setup() -> Env {
     let carol = register(&http, &url, &code, "carol").await;
 
     let post = |who: &Device, path: &str, body: serde_json::Value| {
-        http.post(format!("{url}{path}")).bearer_auth(&who.token).json(&body).send()
+        http.post(format!("{url}{path}"))
+            .bearer_auth(&who.token)
+            .json(&body)
+            .send()
     };
-    post(&alice, "/v1/chats", json!({ "chat_id": CHAT })).await.unwrap().error_for_status().unwrap();
+    post(&alice, "/v1/chats", json!({ "chat_id": CHAT }))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     post(
         &alice,
         &format!("/v1/chats/{CHAT}/commits"),
@@ -125,7 +132,9 @@ async fn connect(env: &Env, who: &Device) -> Ws {
 /// The next server frame, skipping pings; `None` on timeout.
 async fn next_frame(ws: &mut Ws) -> Option<ServerFrame> {
     loop {
-        let msg = tokio::time::timeout(Duration::from_millis(1500), ws.next()).await.ok()??;
+        let msg = tokio::time::timeout(Duration::from_millis(1500), ws.next())
+            .await
+            .ok()??;
         match msg.ok()? {
             Message::Text(t) => return serde_json::from_str(t.as_str()).ok(),
             Message::Close(_) => return None,
@@ -220,9 +229,18 @@ async fn push_subscriptions_must_point_at_a_real_push_service() {
             .json(&json!({ "endpoint": endpoint, "keys": { "p256dh": "x", "auth": "y" } }))
             .send()
     };
-    assert_eq!(put("https://web.push.apple.com/abc").await.unwrap().status(), StatusCode::OK);
-    assert_eq!(put("http://web.push.apple.com/abc").await.unwrap().status(), StatusCode::BAD_REQUEST);
-    assert_eq!(put("https://169.254.169.254/latest").await.unwrap().status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        put("https://web.push.apple.com/abc").await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        put("http://web.push.apple.com/abc").await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        put("https://169.254.169.254/latest").await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]
@@ -254,7 +272,12 @@ async fn attachments_round_trip_for_signed_in_devices_only() {
     assert_eq!(got.status(), StatusCode::OK);
     assert_eq!(got.bytes().await.unwrap().as_ref(), ciphertext.as_slice());
 
-    let anonymous = env.http.get(format!("{}/v1/blobs/{}", env.url, res.id)).send().await.unwrap();
+    let anonymous = env
+        .http
+        .get(format!("{}/v1/blobs/{}", env.url, res.id))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
 
     let too_big = env

@@ -45,9 +45,12 @@ async fn handle(relay: Arc<Relay>, socket: WebSocket) {
         _ => None,
     };
     let Some(device) = device else {
-        let _ = send(&mut tx, &ServerFrame::Error {
-            error: "first frame must be a valid auth frame".into(),
-        })
+        let _ = send(
+            &mut tx,
+            &ServerFrame::Error {
+                error: "first frame must be a valid auth frame".into(),
+            },
+        )
         .await;
         return;
     };

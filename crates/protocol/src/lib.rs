@@ -7,6 +7,11 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Largest encrypted message or receipt the relay accepts.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+/// Largest encrypted attachment (a photo) the relay accepts.
+pub const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
+
 /// Opaque bytes, carried as base64 in JSON.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Bytes(pub Vec<u8>);
@@ -78,6 +83,10 @@ pub struct InviteResponse {
 pub struct UploadKeyPackagesRequest {
     pub key_packages: Vec<Bytes>,
     pub last_resort: Option<Bytes>,
+    /// Drop this device's unclaimed single-use packages first. Devices do
+    /// this every few weeks so nobody is handed one that has expired.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,6 +150,9 @@ pub struct CommitResponse {
 pub struct SendMessageRequest {
     pub epoch: u64,
     pub ciphertext: Bytes,
+    /// Receipts and profile updates: deliver, but don't wake anyone's phone.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,8 +247,13 @@ pub enum ServerFrame {
     /// New mail is waiting: fetch `/v1/mailbox`. Carries no content.
     Mail,
     /// Someone in `chat_id` is typing (encrypted).
-    Typing { chat_id: String, payload: Bytes },
-    Error { error: String },
+    Typing {
+        chat_id: String,
+        payload: Bytes,
+    },
+    Error {
+        error: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

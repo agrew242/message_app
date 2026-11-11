@@ -53,11 +53,9 @@ pub const MAILBOX_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// How long an invite code stays valid.
 pub const INVITE_TTL_SECS: i64 = 7 * 24 * 3600;
 /// Upper bounds that keep a misbehaving client from filling the disk.
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+pub use messenger_protocol::{MAX_BLOB_BYTES, MAX_MESSAGE_BYTES};
 pub const MAX_HANDSHAKE_BYTES: usize = 1024 * 1024;
 pub const MAX_KEY_PACKAGES_PER_DEVICE: i64 = 500;
-/// Encrypted photos and files.
-pub const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
 /// Delivered or not, attachments older than this are deleted.
 pub const BLOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
@@ -155,11 +153,9 @@ impl Relay {
         let hash = sha256(token.as_bytes());
         self.with_db(|conn| {
             let found: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT id, user_id FROM devices WHERE token_hash = ?1",
-                    [&hash],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                .query_row("SELECT id, user_id FROM devices WHERE token_hash = ?1", [&hash], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .optional()?;
             if let Some((device_id, _)) = &found {
                 conn.execute(
@@ -198,9 +194,8 @@ impl Relay {
                 match relay.push.send(&endpoint, now()).await {
                     PushOutcome::Sent => {}
                     PushOutcome::Gone => {
-                        let _ = relay.with_db(|c| {
-                            c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&device])
-                        });
+                        let _ = relay
+                            .with_db(|c| c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&device]));
                     }
                     PushOutcome::Failed(e) => tracing::warn!("web push failed: {e}"),
                 }
@@ -270,15 +265,10 @@ impl Relay {
         self.with_db(|conn| {
             let cutoff = now() - MAILBOX_RETENTION_SECS;
             let mail = conn.execute("DELETE FROM mailbox WHERE created_at < ?1", [cutoff])?;
-            let invites = conn.execute(
-                "DELETE FROM invites WHERE used_by IS NULL AND expires_at < ?1",
-                [now()],
-            )?;
-            let blobs = conn.execute(
-                "DELETE FROM blobs WHERE created_at < ?1",
-                [now() - BLOB_RETENTION_SECS],
-            )?;
-            Ok(mail + invites + blobs)
+            let invites = conn.execute("DELETE FROM invites WHERE used_by IS NULL AND expires_at < ?1", [now()])?;
+            let blobs = conn.execute("DELETE FROM blobs WHERE created_at < ?1", [now() - BLOB_RETENTION_SECS])?;
+            let commits = conn.execute("DELETE FROM commit_log WHERE created_at < ?1", [cutoff])?;
+            Ok(mail + invites + blobs + commits)
         })
     }
 }
@@ -403,6 +393,14 @@ impl ApiError {
             current_epoch: Some(current),
         }
     }
+
+    fn unread_mail(current: u64) -> Self {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: "read the mail waiting for you in this chat, then retry".into(),
+            current_epoch: Some(current),
+        }
+    }
 }
 
 impl From<rusqlite::Error> for ApiError {
@@ -437,10 +435,7 @@ pub struct AuthDevice {
 impl FromRequestParts<Arc<Relay>> for AuthDevice {
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        relay: &Arc<Relay>,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, relay: &Arc<Relay>) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
             .get(AUTHORIZATION)
@@ -455,10 +450,7 @@ impl FromRequestParts<Arc<Relay>> for AuthDevice {
 // Accounts
 // ---------------------------------------------------------------------------
 
-async fn register(
-    State(relay): State<Arc<Relay>>,
-    Json(req): Json<RegisterRequest>,
-) -> ApiResult<RegisterResponse> {
+async fn register(State(relay): State<Arc<Relay>>, Json(req): Json<RegisterRequest>) -> ApiResult<RegisterResponse> {
     validate_username(&req.username)?;
     relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -474,12 +466,11 @@ async fn register(
             Some((None, expires_at)) if expires_at >= now() => {}
             _ => return Err(ApiError::forbidden("invite code is invalid, used or expired")),
         }
-        let taken: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1)",
-                [&req.username],
-                |r| r.get(0),
-            )?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1)",
+            [&req.username],
+            |r| r.get(0),
+        )?;
         if taken {
             return Err(ApiError::new(StatusCode::CONFLICT, "username is taken"));
         }
@@ -543,6 +534,12 @@ async fn upload_key_packages(
     }
     relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if req.replace {
+            tx.execute(
+                "DELETE FROM key_packages WHERE device_id = ?1 AND last_resort = 0",
+                [&me.device_id],
+            )?;
+        }
         let have: i64 = tx.query_row(
             "SELECT COUNT(*) FROM key_packages WHERE device_id = ?1 AND last_resort = 0",
             [&me.device_id],
@@ -678,21 +675,15 @@ async fn create_chat(
 struct ChatRow {
     epoch: u64,
     next_seq: u64,
-    last_commit_hash: Option<Vec<u8>>,
 }
 
 fn load_chat(conn: &Connection, chat_id: &str) -> Result<ChatRow, ApiError> {
-    conn.query_row(
-        "SELECT epoch, next_seq, last_commit_hash FROM chats WHERE id = ?1",
-        [chat_id],
-        |r| {
-            Ok(ChatRow {
-                epoch: r.get::<_, i64>(0)? as u64,
-                next_seq: r.get::<_, i64>(1)? as u64,
-                last_commit_hash: r.get(2)?,
-            })
-        },
-    )
+    conn.query_row("SELECT epoch, next_seq FROM chats WHERE id = ?1", [chat_id], |r| {
+        Ok(ChatRow {
+            epoch: r.get::<_, i64>(0)? as u64,
+            next_seq: r.get::<_, i64>(1)? as u64,
+        })
+    })
     .optional()?
     .ok_or_else(|| ApiError::not_found("no such chat"))
 }
@@ -728,7 +719,9 @@ async fn submit_commit(
         return Err(ApiError::bad_request("commit is empty or too large"));
     }
     if req.added_devices.is_empty() != req.welcome.is_none() {
-        return Err(ApiError::bad_request("a Welcome is required exactly when devices are added"));
+        return Err(ApiError::bad_request(
+            "a Welcome is required exactly when devices are added",
+        ));
     }
     if let Some(w) = &req.welcome {
         if w.0.len() > MAX_HANDSHAKE_BYTES {
@@ -743,32 +736,54 @@ async fn submit_commit(
     let (response, commit_to, welcome_to) = relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chat = load_chat(&tx, &chat_id)?;
+
+        // A retry of a Commit we already accepted (the response got lost, or
+        // the app crashed before hearing back) succeeds again instead of
+        // failing as a conflict, even if newer Commits have landed since.
+        // Only the author has these exact bytes, so this reveals nothing.
+        if req.epoch < chat.epoch {
+            let accepted: Option<(Vec<u8>, i64)> = tx
+                .query_row(
+                    "SELECT hash, chat_seq FROM commit_log WHERE chat_id = ?1 AND epoch = ?2",
+                    params![chat_id, req.epoch as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((hash, seq)) = accepted {
+                if hash == commit_hash {
+                    let response = CommitResponse {
+                        epoch: req.epoch + 1,
+                        chat_seq: seq as u64,
+                    };
+                    return Ok((response, Vec::new(), Vec::new()));
+                }
+            }
+        }
+
         let members = chat_members(&tx, &chat_id)?;
         if !members.contains(&me.device_id) {
             return Err(ApiError::forbidden("not a member of this chat"));
         }
-
-        // A retry of a Commit we already accepted (say the response got lost)
-        // succeeds again instead of failing as a conflict.
-        if chat.last_commit_hash.as_deref() == Some(commit_hash.as_slice())
-            && chat.epoch == req.epoch + 1
-        {
-            let response = CommitResponse {
-                epoch: chat.epoch,
-                chat_seq: chat.next_seq - 1,
-            };
-            return Ok((response, Vec::new(), Vec::new()));
-        }
         if chat.epoch != req.epoch {
             return Err(ApiError::epoch_conflict(chat.epoch));
+        }
+        // A Commit moves its author to the next epoch at once. Anything still
+        // waiting in their mailbox for this chat was sent in this epoch and
+        // could never be decrypted afterwards, so they must catch up first.
+        let behind: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox WHERE device_id = ?1 AND chat_id = ?2)",
+            params![me.device_id, chat_id],
+            |r| r.get(0),
+        )?;
+        if behind {
+            return Err(ApiError::unread_mail(chat.epoch));
         }
 
         for (i, d) in req.added_devices.iter().enumerate() {
             if members.contains(d) || req.added_devices[..i].contains(d) {
                 return Err(ApiError::bad_request("device is already a member"));
             }
-            let exists: bool =
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1)", [d], |r| r.get(0))?;
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1)", [d], |r| r.get(0))?;
             if !exists {
                 return Err(ApiError::bad_request("unknown device in added_devices"));
             }
@@ -801,8 +816,12 @@ async fn submit_commit(
             )?;
         }
         tx.execute(
-            "UPDATE chats SET epoch = epoch + 1, next_seq = next_seq + 1, last_commit_hash = ?1 WHERE id = ?2",
-            params![commit_hash, chat_id],
+            "UPDATE chats SET epoch = epoch + 1, next_seq = next_seq + 1 WHERE id = ?1",
+            [&chat_id],
+        )?;
+        tx.execute(
+            "INSERT INTO commit_log (chat_id, epoch, hash, chat_seq, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chat_id, req.epoch as i64, commit_hash, seq as i64, now()],
         )?;
         tx.commit()?;
         let commit_to: Vec<String> = members.into_iter().filter(|m| *m != me.device_id).collect();
@@ -846,7 +865,9 @@ async fn send_message(
         tx.commit()?;
         Ok::<_, ApiError>((SendMessageResponse { chat_seq: seq }, recipients))
     })?;
-    relay.notify(&recipients, true);
+    // Receipts and profile updates still arrive live; they just don't wake
+    // a sleeping phone.
+    relay.notify(&recipients, !req.silent);
     Ok(Json(response))
 }
 

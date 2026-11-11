@@ -186,8 +186,7 @@ mod tests {
         let jwt = p.vapid_jwt("https://web.push.apple.com", 1_000_000);
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);
-        let claims: serde_json::Value =
-            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["aud"], "https://web.push.apple.com");
         assert_eq!(claims["exp"], 1_000_000 + 12 * 3600);
         assert_eq!(claims["sub"], "mailto:admin@example.com");
@@ -196,7 +195,8 @@ mod tests {
         assert_eq!(public.len(), 65, "uncompressed P-256 point");
         let vk = VerifyingKey::from_sec1_bytes(&public).unwrap();
         let sig = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
-        vk.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).unwrap();
+        vk.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
+            .unwrap();
     }
 
     #[test]

@@ -49,9 +49,20 @@ CREATE TABLE IF NOT EXISTS chats (
     id               TEXT PRIMARY KEY,
     epoch            INTEGER NOT NULL DEFAULT 0,
     next_seq         INTEGER NOT NULL DEFAULT 1,
-    last_commit_hash BLOB,
     created_at       INTEGER NOT NULL
 );
+
+-- Hashes of accepted Commits, so a device that crashed before hearing back
+-- can resubmit its Commit and learn it went through, even after newer ones.
+CREATE TABLE IF NOT EXISTS commit_log (
+    chat_id     TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    epoch       INTEGER NOT NULL,   -- the epoch the Commit was made in
+    hash        BLOB NOT NULL,
+    chat_seq    INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, epoch)
+);
+CREATE INDEX IF NOT EXISTS commit_log_by_age ON commit_log(created_at);
 
 CREATE TABLE IF NOT EXISTS chat_members (
     chat_id     TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,

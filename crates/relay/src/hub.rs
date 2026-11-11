@@ -12,9 +12,12 @@ use std::{
 use messenger_protocol::ServerFrame;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+/// One live connection: its id and where to send it frames.
+type Conn = (u64, UnboundedSender<ServerFrame>);
+
 #[derive(Default)]
 pub struct Hub {
-    conns: Mutex<HashMap<String, Vec<(u64, UnboundedSender<ServerFrame>)>>>,
+    conns: Mutex<HashMap<String, Vec<Conn>>>,
     next_id: AtomicU64,
 }
 

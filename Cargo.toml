@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/core", "crates/relay", "crates/client"]
+members = ["crates/protocol", "crates/core", "crates/session", "crates/relay", "crates/client"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,4 +25,5 @@ openmls_rust_crypto = "0.6.0"
 
 messenger-protocol = { path = "crates/protocol" }
 messenger-core = { path = "crates/core" }
+messenger-session = { path = "crates/session" }
 messenger-relay = { path = "crates/relay" }

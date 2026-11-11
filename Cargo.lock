@@ -1851,15 +1851,13 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
- "base64 0.22.1",
  "clap",
  "futures-util",
- "messenger-core",
  "messenger-protocol",
  "messenger-relay",
+ "messenger-session",
  "rand 0.9.5",
  "reqwest",
- "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1870,13 +1868,16 @@ dependencies = [
 name = "messenger-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "base64 0.22.1",
  "hex",
  "openmls",
  "openmls_basic_credential",
  "openmls_rust_crypto",
+ "openmls_traits",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
 ]
 
@@ -1911,6 +1912,17 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "messenger-session"
+version = "0.1.0"
+dependencies = [
+ "messenger-core",
+ "messenger-protocol",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]
