@@ -517,7 +517,15 @@ async function typeInto(page, label, text) {
   const { handle } = await field(page, label);
   await handle.click();
   await sleep(150);
-  await page.keyboard.type(text, { delay: 10 });
+  // A multi-line field's accessibility node wraps the real text area.
+  const editable = await handle.evaluateHandle((el) =>
+    el.matches('input, textarea') ? el : el.querySelector('input, textarea'),
+  );
+  if (editable.asElement()) await editable.asElement().focus();
+  // Insert the text the way a phone keyboard or autocorrect does. (Puppeteer's
+  // synthetic key presses send Shift without a left/right location, which
+  // Flutter's keyboard code doesn't expect from a real keyboard.)
+  await page.keyboard.sendCharacter(text);
   await sleep(250);
   const focused = await page.evaluate(() => {
     const el = document.activeElement;
@@ -587,7 +595,7 @@ async function uiEndToEnd(browser, relayBin, buildDir) {
       await handle.click(); // the chat in the list
       await shows(bob.page, 'Alice added you');
       await typeInto(bob.page, 'Message', 'hi alice');
-      await bob.page.keyboard.press('Enter');
+      await press(bob.page, 'Send');
       await shows(alice.page, 'hi alice');
       await shows(alice.page, 'Seen');
     });
