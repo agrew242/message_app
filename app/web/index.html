@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <base href="$FLUTTER_BASE_HREF">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="Private, end-to-end encrypted messages for you and your friends.">
+  <meta name="theme-color" content="#0084ff">
+  <meta name="referrer" content="no-referrer">
+
+  <!-- Installable on iPhone: Share > Add to Home Screen -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Messenger">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="manifest" href="manifest.json">
+
+  <title>Messenger</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #fff; }
+    #loading { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+               font: 15px system-ui, -apple-system, sans-serif; color: #65676b; }
+  </style>
+</head>
+<body>
+  <div id="loading">Loading…</div>
+  <!-- Reads friends' QR codes (Safari has no built-in reader). -->
+  <script src="messenger/vendor/jsQR.js" defer></script>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>

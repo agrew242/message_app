@@ -174,6 +174,16 @@ pub struct ImageInfo {
     pub caption: Option<String>,
 }
 
+/// A photo encrypted and ready to upload: see [`Session::prepare_photo`].
+#[derive(Clone, Debug)]
+pub struct PhotoUpload {
+    pub request: HttpRequest,
+    key: String,
+    sha256: String,
+    size: u64,
+    info: ImageInfo,
+}
+
 /// What a frame on the relay's live stream means.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -765,6 +775,19 @@ impl<P: Platform> Session<P> {
 
     /// Encrypts a photo, uploads it, and sends the key in a message.
     pub async fn send_image(&mut self, chat_id: &str, bytes: &[u8], info: ImageInfo) -> Result<ChatMessage> {
+        let upload = self.prepare_photo(chat_id, bytes, info)?;
+        let response = self
+            .platform
+            .fetch(upload.request.clone())
+            .await
+            .map_err(SessionError::Offline)?;
+        self.send_uploaded_photo(chat_id, upload, response).await
+    }
+
+    /// First half of [`Self::send_image`]: checks and encrypts the photo, and
+    /// builds the upload. A platform can run the upload without holding the
+    /// session, then finish with [`Self::send_uploaded_photo`].
+    pub fn prepare_photo(&self, chat_id: &str, bytes: &[u8], info: ImageInfo) -> Result<PhotoUpload> {
         if bytes.is_empty() || bytes.len() > MAX_PHOTO_BYTES {
             return Err(invalid("photos can be up to 10 MB"));
         }
@@ -778,25 +801,41 @@ impl<P: Platform> Session<P> {
             return Err(CoreError::NotAMember(chat_id.to_owned()).into());
         }
         let sealed = self.engine.seal_attachment(bytes)?;
-        let uploaded: BlobResponse = decode(
-            self.request(
-                "POST",
-                "/v1/blobs",
-                Some(("application/octet-stream", sealed.ciphertext)),
-            )
-            .await?,
-        )?;
-        let attachment = Attachment {
-            blob_id: uploaded.id,
+        Ok(PhotoUpload {
+            request: HttpRequest {
+                method: "POST",
+                url: format!("{}/v1/blobs", self.relay_url),
+                bearer: Some(self.token.clone()),
+                content_type: Some("application/octet-stream"),
+                body: Some(sealed.ciphertext),
+            },
             key: sealed.key,
             sha256: sealed.sha256,
-            mime: info.mime,
             size: bytes.len() as u64,
-            width: info.width,
-            height: info.height,
-            thumbnail: info.thumbnail,
+            info,
+        })
+    }
+
+    /// Second half of [`Self::send_image`]: given the relay's answer to the
+    /// upload, sends the message carrying the photo's key.
+    pub async fn send_uploaded_photo(
+        &mut self,
+        chat_id: &str,
+        upload: PhotoUpload,
+        response: HttpResponse,
+    ) -> Result<ChatMessage> {
+        let uploaded: BlobResponse = decode(check_status(response)?)?;
+        let attachment = Attachment {
+            blob_id: uploaded.id,
+            key: upload.key,
+            sha256: upload.sha256,
+            mime: upload.info.mime,
+            size: upload.size,
+            width: upload.info.width,
+            height: upload.info.height,
+            thumbnail: upload.info.thumbnail,
         };
-        let caption = info.caption.filter(|c| !c.trim().is_empty());
+        let caption = upload.info.caption.filter(|c| !c.trim().is_empty());
         self.send(chat_id, Body::Image { attachment, caption })
             .await?
             .ok_or_else(|| invalid("photo wasn't recorded"))
@@ -804,12 +843,26 @@ impl<P: Platform> Session<P> {
 
     /// Downloads a photo and checks and decrypts it.
     pub async fn fetch_attachment(&self, attachment: &Attachment) -> Result<Vec<u8>> {
+        let request = self.attachment_request(attachment)?;
+        let response = self.platform.fetch(request).await.map_err(SessionError::Offline)?;
+        Ok(open_attachment(&check_status(response)?, attachment)?)
+    }
+
+    /// The request that downloads a photo's ciphertext, so a platform can
+    /// fetch it without holding the session. Check the answer with
+    /// [`open_attachment`].
+    pub fn attachment_request(&self, attachment: &Attachment) -> Result<HttpRequest> {
         let id = &attachment.blob_id;
         if id.len() != 32 || !id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) {
             return Err(invalid("that attachment's id is malformed"));
         }
-        let bytes = self.request("GET", &format!("/v1/blobs/{id}"), None).await?;
-        Ok(open_attachment(&bytes, attachment)?)
+        Ok(HttpRequest {
+            method: "GET",
+            url: format!("{}/v1/blobs/{id}", self.relay_url),
+            bearer: Some(self.token.clone()),
+            content_type: None,
+            body: None,
+        })
     }
 
     /// Marks a chat read, and tells the senders if read receipts are on.
@@ -862,6 +915,12 @@ impl<P: Platform> Session<P> {
         let outcome = self.engine.verify_code(code.trim())?;
         self.save().await?;
         Ok(outcome)
+    }
+
+    /// After comparing safety numbers on a call instead of scanning.
+    pub async fn mark_verified(&mut self, username: &str) -> Result<()> {
+        self.engine.mark_verified(username)?;
+        self.save().await
     }
 
     /// Accepts a verified friend's new identity key without meeting up.
@@ -1118,6 +1177,18 @@ async fn relay_request<P: Platform>(
         return Err(ApiError::Conflict);
     }
     Err(ApiError::Status {
+        status: res.status,
+        message: err.map(|e| e.error).unwrap_or_default(),
+    })
+}
+
+/// The body of a successful response, or the relay's error.
+pub fn check_status(res: HttpResponse) -> Result<Vec<u8>> {
+    if (200..300).contains(&res.status) {
+        return Ok(res.body);
+    }
+    let err: Option<ErrorResponse> = serde_json::from_slice(&res.body).ok();
+    Err(SessionError::Relay {
         status: res.status,
         message: err.map(|e| e.error).unwrap_or_default(),
     })

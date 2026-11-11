@@ -15,8 +15,8 @@ use std::rc::Rc;
 use futures_util::lock::Mutex;
 use js_sys::{Function, Object, Promise, Reflect, Uint8Array};
 use messenger_session::{
-    Attachment, CoreError, HttpRequest, HttpResponse, ImageInfo, Platform, PushSubscription, Session, SessionError,
-    Settings, VerifyOutcome,
+    check_status, open_attachment, Attachment, CoreError, HttpRequest, HttpResponse, ImageInfo, Platform,
+    PushSubscription, Session, SessionError, Settings, VerifyOutcome,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use wasm_bindgen::{prelude::*, JsCast};
@@ -49,47 +49,7 @@ fn global_fn(name: &str) -> Result<Function, String> {
 
 impl Platform for WasmPlatform {
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse, String> {
-        let init = Object::new();
-        let set = |obj: &Object, k: &str, v: &JsValue| Reflect::set(obj, &k.into(), v).map(|_| ()).map_err(js_text);
-        set(&init, "method", &req.method.into())?;
-        let headers = Object::new();
-        if let Some(token) = &req.bearer {
-            set(&headers, "authorization", &format!("Bearer {token}").into())?;
-        }
-        if let Some(ct) = req.content_type {
-            set(&headers, "content-type", &ct.into())?;
-        }
-        set(&init, "headers", &headers)?;
-        if let Some(body) = &req.body {
-            set(&init, "body", &Uint8Array::from(body.as_slice()))?;
-        }
-        let promise: Promise = global_fn("fetch")?
-            .call2(&js_sys::global(), &req.url.into(), &init)
-            .map_err(js_text)?
-            .dyn_into()
-            .map_err(|_| "fetch didn't return a promise".to_string())?;
-        let res = JsFuture::from(promise).await.map_err(js_text)?;
-        let status = Reflect::get(&res, &"status".into())
-            .map_err(js_text)?
-            .as_f64()
-            .unwrap_or(0.0) as u16;
-        let array_buffer = Reflect::get(&res, &"arrayBuffer".into())
-            .map_err(js_text)?
-            .dyn_into::<Function>()
-            .map_err(|_| "response has no arrayBuffer()".to_string())?;
-        let buf = JsFuture::from(
-            array_buffer
-                .call0(&res)
-                .map_err(js_text)?
-                .dyn_into::<Promise>()
-                .map_err(|_| "arrayBuffer() didn't return a promise".to_string())?,
-        )
-        .await
-        .map_err(js_text)?;
-        Ok(HttpResponse {
-            status,
-            body: Uint8Array::new(&buf).to_vec(),
-        })
+        js_fetch(req).await
     }
 
     async fn save(&self, state: &[u8]) -> Result<(), String> {
@@ -117,6 +77,51 @@ impl Platform for WasmPlatform {
     fn now_ms(&self) -> i64 {
         js_sys::Date::now() as i64
     }
+}
+
+/// One request through the global `fetch`.
+async fn js_fetch(req: HttpRequest) -> Result<HttpResponse, String> {
+    let init = Object::new();
+    let set = |obj: &Object, k: &str, v: &JsValue| Reflect::set(obj, &k.into(), v).map(|_| ()).map_err(js_text);
+    set(&init, "method", &req.method.into())?;
+    let headers = Object::new();
+    if let Some(token) = &req.bearer {
+        set(&headers, "authorization", &format!("Bearer {token}").into())?;
+    }
+    if let Some(ct) = req.content_type {
+        set(&headers, "content-type", &ct.into())?;
+    }
+    set(&init, "headers", &headers)?;
+    if let Some(body) = &req.body {
+        set(&init, "body", &Uint8Array::from(body.as_slice()))?;
+    }
+    let promise: Promise = global_fn("fetch")?
+        .call2(&js_sys::global(), &req.url.into(), &init)
+        .map_err(js_text)?
+        .dyn_into()
+        .map_err(|_| "fetch didn't return a promise".to_string())?;
+    let res = JsFuture::from(promise).await.map_err(js_text)?;
+    let status = Reflect::get(&res, &"status".into())
+        .map_err(js_text)?
+        .as_f64()
+        .unwrap_or(0.0) as u16;
+    let array_buffer = Reflect::get(&res, &"arrayBuffer".into())
+        .map_err(js_text)?
+        .dyn_into::<Function>()
+        .map_err(|_| "response has no arrayBuffer()".to_string())?;
+    let buf = JsFuture::from(
+        array_buffer
+            .call0(&res)
+            .map_err(js_text)?
+            .dyn_into::<Promise>()
+            .map_err(|_| "arrayBuffer() didn't return a promise".to_string())?,
+    )
+    .await
+    .map_err(js_text)?;
+    Ok(HttpResponse {
+        status,
+        body: Uint8Array::new(&buf).to_vec(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -332,21 +337,43 @@ impl Messenger {
     }
 
     /// `info_json`: `{mime, width?, height?, thumbnail?, caption?}`.
-    /// Resolves to the sent message, as JSON.
+    /// Resolves to the sent message, as JSON. The upload itself doesn't hold
+    /// up other calls.
     #[wasm_bindgen(js_name = sendImage)]
     pub fn send_image(&self, chat_id: String, bytes: Vec<u8>, info_json: String) -> Promise {
-        op!(self, |s| {
+        let inner = self.inner.clone();
+        future_to_promise(async move {
             let info: ImageInfo = parse(&info_json)?;
-            json(&s.send_image(&chat_id, &bytes, info).await.map_err(js_error)?)
+            let upload = inner
+                .lock()
+                .await
+                .prepare_photo(&chat_id, &bytes, info)
+                .map_err(js_error)?;
+            let response = js_fetch(upload.request.clone())
+                .await
+                .map_err(|e| js_error(SessionError::Offline(e)))?;
+            let mut s = inner.lock().await;
+            json(
+                &s.send_uploaded_photo(&chat_id, upload, response)
+                    .await
+                    .map_err(js_error)?,
+            )
         })
     }
 
     /// Downloads and decrypts a photo, given a message's `attachment` JSON.
+    /// The download doesn't hold up other calls.
     #[wasm_bindgen(js_name = fetchAttachment)]
     pub fn fetch_attachment(&self, attachment_json: String) -> Promise {
-        op!(self, |s| {
+        let inner = self.inner.clone();
+        future_to_promise(async move {
             let attachment: Attachment = parse(&attachment_json)?;
-            let bytes = s.fetch_attachment(&attachment).await.map_err(js_error)?;
+            let request = inner.lock().await.attachment_request(&attachment).map_err(js_error)?;
+            let response = js_fetch(request)
+                .await
+                .map_err(|e| js_error(SessionError::Offline(e)))?;
+            let body = check_status(response).map_err(js_error)?;
+            let bytes = open_attachment(&body, &attachment).map_err(|e| js_error(e.into()))?;
             Ok(Uint8Array::from(bytes.as_slice()).into())
         })
     }
@@ -386,6 +413,15 @@ impl Messenger {
                 VerifyOutcome::Verified => "verified",
                 VerifyOutcome::Mismatch => "mismatch",
             }))
+        })
+    }
+
+    /// After comparing safety numbers on a call instead of scanning.
+    #[wasm_bindgen(js_name = markVerified)]
+    pub fn mark_verified(&self, username: String) -> Promise {
+        op!(self, |s| {
+            s.mark_verified(&username).await.map_err(js_error)?;
+            Ok(JsValue::UNDEFINED)
         })
     }
 

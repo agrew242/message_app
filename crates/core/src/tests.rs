@@ -382,6 +382,14 @@ fn safety_numbers_match_on_both_phones() {
         STANDARD.encode(bob.identity.public())
     );
 
+    // Or, comparing the numbers on a call instead of scanning:
+    let mut carol = device("carol", "c1");
+    pair(&mut bob, &mut carol);
+    assert!(!bob.contact("carol").unwrap().verified);
+    bob.mark_verified("carol").unwrap();
+    assert!(bob.contact("carol").unwrap().verified);
+    assert!(bob.mark_verified("nobody").is_err());
+
     assert!(alice.verify_code(&alice.verification_code()).is_err());
     assert!(alice.verify_code("not a code").is_err());
     assert!(alice.safety_number("nobody").is_err());

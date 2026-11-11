@@ -619,6 +619,17 @@ impl Engine {
         self.contacts.get(username)
     }
 
+    /// Marks a contact verified after comparing safety numbers some other
+    /// trusted way, such as reading them out on a call.
+    pub fn mark_verified(&mut self, username: &str) -> Result<()> {
+        let c = self
+            .contacts
+            .get_mut(username)
+            .ok_or_else(|| CoreError::UnknownMember(username.to_owned()))?;
+        c.verified = true;
+        Ok(())
+    }
+
     /// Accepts that a verified contact's identity key changed, without
     /// verifying in person. The next add pins the new key, unverified.
     pub fn reset_verification(&mut self, username: &str) {
