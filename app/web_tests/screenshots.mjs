@@ -23,7 +23,6 @@ import puppeteer from 'puppeteer-core';
 import {
   GLUE_PAGE,
   activate,
-  axDump,
   axFind,
   chromePath,
   field,
@@ -115,24 +114,6 @@ async function joined(page, chatId = null) {
     chatId,
   );
   return found.jsonValue();
-}
-
-/** The innermost node whose text includes `text`, as an element. */
-async function innermost(page, text, timeout = 20000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    let best = null;
-    const walk = (n, depth) => {
-      if (!n) return;
-      if (words(n).includes(text) && (!best || depth > best.depth)) best = { n, depth };
-      for (const c of n.children ?? []) walk(c, depth + 1);
-    };
-    walk(await page.accessibility.snapshot({ interestingOnly: false }), 0);
-    const handle = best ? await best.n.elementHandle() : null;
-    if (handle) return handle;
-    await sleep(250);
-  }
-  throw new Error(`"${text}" not found. The screen shows:\n${await axDump(page)}`);
 }
 
 async function back(page) {
@@ -280,10 +261,11 @@ async function scenario(browser, mode) {
     );
     await snap('5-group');
 
-    // Settings, from Alex's picture on the chat list.
+    // Settings, from Alex's picture on the chat list (a button named for its
+    // tooltip and the initials on it: "Settings AR").
     await back(a);
     await shows(a, "What's your address again?");
-    await activate(a, await innermost(a, 'Settings'));
+    await press(a, 'Settings');
     await shows(a, 'Read receipts');
     await snap('6-settings');
   } catch (e) {
