@@ -5,6 +5,11 @@ on:
     branches: [main, phase-1]
   pull_request:
   workflow_dispatch:
+    inputs:
+      screenshots:
+        description: Also take screenshots of the app at iPhone size
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -102,6 +107,18 @@ jobs:
         run: |
           npm ci
           RELAY_BIN=../../target/debug/messenger-relay FLUTTER_BUILD=../build/web FLUTTER_UI_BUILD=../build/web-ui node run.mjs
+      - name: Screenshots at iPhone size (on request)
+        if: inputs.screenshots
+        continue-on-error: true
+        working-directory: app/web_tests
+        run: |
+          RELAY_BIN=../../target/debug/messenger-relay FLUTTER_UI_BUILD=../build/web-ui PRINT_SCREENSHOTS=1 node screenshots.mjs
+      - uses: actions/upload-artifact@v7
+        if: inputs.screenshots
+        with:
+          name: messenger-screenshots
+          path: app/web_tests/screenshots
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v7
         with:
           name: messenger-web
