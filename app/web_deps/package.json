@@ -1,0 +1,8 @@
+{
+  "name": "messenger-web-deps",
+  "private": true,
+  "description": "Third-party browser code bundled with the web app. `npm ci` here, then copy into web/messenger/vendor/ (CI does this).",
+  "dependencies": {
+    "jsqr": "^1.4.0"
+  }
+}

@@ -1,0 +1,10 @@
+# Only the Rust workspace goes into the relay's image.
+target/
+app/
+.git/
+.github/
+deploy/backups/
+**/node_modules/
+*.db
+*.db-wal
+*.db-shm

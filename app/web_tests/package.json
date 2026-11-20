@@ -1,0 +1,12 @@
+{
+  "name": "messenger-web-tests",
+  "private": true,
+  "type": "module",
+  "description": "Browser tests for the web glue (storage, photos) and, when the WebAssembly build and a relay are available, end to end through real Chrome.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

@@ -7,10 +7,17 @@
 //!   current epoch, and one agreed order per chat
 //! - a mailbox per device that keeps ciphertext until the device acknowledges
 //!   it, or 30 days at most
+//! - live delivery: a WebSocket that says "you have mail" (never the mail
+//!   itself) and forwards encrypted typing signals without storing them
+//! - content-free web push to wake devices that aren't connected
+//! - encrypted photo storage, deleted after 30 days
 //!
 //! It never decrypts anything, and it never logs request bodies.
 
 pub mod db;
+pub mod hub;
+pub mod push;
+mod stream;
 
 use std::{
     path::Path,
@@ -19,45 +26,211 @@ use std::{
 };
 
 use axum::{
-    extract::{FromRequestParts, MatchedPath, Path as UrlPath, Query, Request, State},
-    http::{header::AUTHORIZATION, request::Parts, StatusCode},
+    extract::{DefaultBodyLimit, FromRequestParts, MatchedPath, Path as UrlPath, Query, Request, State},
+    http::{
+        header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE},
+        request::Parts,
+        HeaderValue, Method, StatusCode,
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use hub::Hub;
 use messenger_protocol::*;
+use push::{Push, PushOutcome};
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 
 /// Delivered or not, mail older than this is deleted.
 pub const MAILBOX_RETENTION_SECS: i64 = 30 * 24 * 3600;
 /// How long an invite code stays valid.
 pub const INVITE_TTL_SECS: i64 = 7 * 24 * 3600;
 /// Upper bounds that keep a misbehaving client from filling the disk.
-pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+pub use messenger_protocol::{MAX_BLOB_BYTES, MAX_MESSAGE_BYTES};
 pub const MAX_HANDSHAKE_BYTES: usize = 1024 * 1024;
 pub const MAX_KEY_PACKAGES_PER_DEVICE: i64 = 500;
+/// Delivered or not, attachments older than this are deleted.
+pub const BLOB_RETENTION_SECS: i64 = 30 * 24 * 3600;
+
+/// Settings that differ between deployments.
+#[derive(Clone, Debug)]
+pub struct RelayConfig {
+    /// Web app origins allowed to call the API from a browser, such as
+    /// `https://app.example.com`. Empty means same-origin only.
+    pub allowed_origins: Vec<String>,
+    /// Contact for push services, `mailto:` or `https:` (RFC 8292).
+    pub vapid_subject: String,
+    /// Push service hosts the relay may call; `.suffix` matches subdomains.
+    pub push_hosts: Vec<String>,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        RelayConfig {
+            allowed_origins: Vec::new(),
+            vapid_subject: "mailto:admin@localhost".into(),
+            push_hosts: push::DEFAULT_PUSH_HOSTS.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+}
+
+impl RelayConfig {
+    /// `RELAY_ALLOWED_ORIGINS` and `RELAY_PUSH_HOSTS` are comma-separated;
+    /// `RELAY_VAPID_SUBJECT` is a single `mailto:` or `https:` URL.
+    pub fn from_env() -> Self {
+        let list = |name: &str| -> Option<Vec<String>> {
+            std::env::var(name).ok().map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+        };
+        let default = RelayConfig::default();
+        RelayConfig {
+            allowed_origins: list("RELAY_ALLOWED_ORIGINS").unwrap_or_default(),
+            vapid_subject: std::env::var("RELAY_VAPID_SUBJECT").unwrap_or(default.vapid_subject),
+            push_hosts: list("RELAY_PUSH_HOSTS").unwrap_or(default.push_hosts),
+        }
+    }
+}
 
 pub struct Relay {
     db: Mutex<Connection>,
+    hub: Hub,
+    push: Push,
+    config: RelayConfig,
 }
 
 impl Relay {
     pub fn open(path: &Path) -> anyhow::Result<Arc<Self>> {
+        Self::open_with(path, RelayConfig::default())
+    }
+
+    pub fn open_with(path: &Path, config: RelayConfig) -> anyhow::Result<Arc<Self>> {
         let conn = db::open(path)?;
+        // The VAPID key is made once and kept: browsers bind subscriptions
+        // to it, so changing it would silently break every subscription.
+        let stored: Option<Vec<u8>> = conn
+            .query_row("SELECT value FROM server_keys WHERE name = 'vapid'", [], |r| r.get(0))
+            .optional()?;
+        let private_key: [u8; 32] = match stored {
+            Some(bytes) => bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("stored VAPID key is corrupt"))?,
+            None => {
+                let key = Push::generate_private_key();
+                conn.execute(
+                    "INSERT INTO server_keys (name, value) VALUES ('vapid', ?1)",
+                    [key.as_slice()],
+                )?;
+                key
+            }
+        };
+        let push = Push::new(&private_key, config.vapid_subject.clone(), config.push_hosts.clone())?;
         Ok(Arc::new(Relay {
             db: Mutex::new(conn),
+            hub: Hub::default(),
+            push,
+            config,
         }))
     }
 
     fn with_db<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
         let mut guard = self.db.lock().expect("relay database lock poisoned");
         f(&mut guard)
+    }
+
+    /// The device a token belongs to, if any.
+    fn authenticate(&self, token: &str) -> Result<Option<AuthDevice>, rusqlite::Error> {
+        let hash = sha256(token.as_bytes());
+        self.with_db(|conn| {
+            let found: Option<(String, String)> = conn
+                .query_row("SELECT id, user_id FROM devices WHERE token_hash = ?1", [&hash], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            if let Some((device_id, _)) = &found {
+                conn.execute(
+                    "UPDATE devices SET last_seen = ?1 WHERE id = ?2",
+                    params![now(), device_id],
+                )?;
+            }
+            Ok(found.map(|(device_id, user_id)| AuthDevice { device_id, user_id }))
+        })
+    }
+
+    /// Tells devices they have mail: over their live connection if they
+    /// have one, otherwise (when `wake` is set) with an empty web push.
+    fn notify(self: &Arc<Self>, devices: &[String], wake: bool) {
+        for device in devices {
+            if self.hub.send(device, &ServerFrame::Mail) || !wake {
+                continue;
+            }
+            if !self.push.should_send(device) {
+                continue;
+            }
+            let endpoint: Option<String> = self
+                .with_db(|c| {
+                    c.query_row(
+                        "SELECT endpoint FROM push_subscriptions WHERE device_id = ?1",
+                        [device],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                })
+                .unwrap_or(None);
+            let Some(endpoint) = endpoint else { continue };
+            let relay = self.clone();
+            let device = device.clone();
+            tokio::spawn(async move {
+                match relay.push.send(&endpoint, now()).await {
+                    PushOutcome::Sent => {}
+                    PushOutcome::Gone => {
+                        let _ = relay
+                            .with_db(|c| c.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&device]));
+                    }
+                    PushOutcome::Failed(e) => tracing::warn!("web push failed: {e}"),
+                }
+            });
+        }
+    }
+
+    /// Passes an encrypted typing signal to the chat's other connected
+    /// devices. Never stored, never pushed.
+    fn forward_typing(&self, sender: &AuthDevice, chat_id: &str, payload: Bytes) {
+        if payload.0.is_empty() || payload.0.len() > 1024 {
+            return;
+        }
+        let members = self.with_db(|c| chat_members(c, chat_id)).unwrap_or_default();
+        if !members.contains(&sender.device_id) {
+            return;
+        }
+        let frame = ServerFrame::Typing {
+            chat_id: chat_id.to_owned(),
+            payload,
+        };
+        for m in members.iter().filter(|m| **m != sender.device_id) {
+            self.hub.send(m, &frame);
+        }
+    }
+
+    fn has_mail(&self, device_id: &str) -> bool {
+        self.with_db(|c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM mailbox WHERE device_id = ?1)",
+                [device_id],
+                |r| r.get::<_, bool>(0),
+            )
+        })
+        .unwrap_or(false)
     }
 
     /// When nobody has signed up yet, mint an invite code for the first user.
@@ -92,18 +265,18 @@ impl Relay {
         self.with_db(|conn| {
             let cutoff = now() - MAILBOX_RETENTION_SECS;
             let mail = conn.execute("DELETE FROM mailbox WHERE created_at < ?1", [cutoff])?;
-            let invites = conn.execute(
-                "DELETE FROM invites WHERE used_by IS NULL AND expires_at < ?1",
-                [now()],
-            )?;
-            Ok(mail + invites)
+            let invites = conn.execute("DELETE FROM invites WHERE used_by IS NULL AND expires_at < ?1", [now()])?;
+            let blobs = conn.execute("DELETE FROM blobs WHERE created_at < ?1", [now() - BLOB_RETENTION_SECS])?;
+            let commits = conn.execute("DELETE FROM commit_log WHERE created_at < ?1", [cutoff])?;
+            Ok(mail + invites + blobs + commits)
         })
     }
 }
 
 /// Build the HTTP API.
 pub fn router(relay: Arc<Relay>) -> Router {
-    Router::new()
+    let cors = cors_layer(&relay.config.allowed_origins);
+    let router = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/accounts", post(register))
         .route("/v1/invites", post(create_invite))
@@ -115,8 +288,45 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/v1/chats/{chat_id}/messages", post(send_message))
         .route("/v1/mailbox", get(fetch_mailbox))
         .route("/v1/mailbox/ack", post(ack_mailbox))
+        .route("/v1/stream", get(stream::stream))
+        .route("/v1/push/key", get(vapid_key))
+        .route("/v1/devices/me/push", put(set_push).delete(delete_push))
+        .route(
+            "/v1/blobs",
+            post(upload_blob).layer(DefaultBodyLimit::max(MAX_BLOB_BYTES)),
+        )
+        .route("/v1/blobs/{blob_id}", get(download_blob))
         .layer(middleware::from_fn(log_requests))
-        .with_state(relay)
+        .layer(middleware::from_fn(no_store))
+        .with_state(relay);
+    match cors {
+        Some(cors) => router.layer(cors),
+        None => router,
+    }
+}
+
+/// Nothing the relay says should sit in a browser or proxy cache.
+async fn no_store(req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    res.headers_mut()
+        .entry(axum::http::header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    res
+}
+
+/// Lets the web app, served from its own origin, call the API.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let origins: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+            .max_age(Duration::from_secs(3600)),
+    )
 }
 
 /// Serve the API on `listener` and purge expired data every hour.
@@ -193,6 +403,14 @@ impl ApiError {
             current_epoch: Some(current),
         }
     }
+
+    fn unread_mail(current: u64) -> Self {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: "read the mail waiting for you in this chat, then retry".into(),
+            current_epoch: Some(current),
+        }
+    }
 }
 
 impl From<rusqlite::Error> for ApiError {
@@ -227,32 +445,14 @@ pub struct AuthDevice {
 impl FromRequestParts<Arc<Relay>> for AuthDevice {
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        relay: &Arc<Relay>,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, relay: &Arc<Relay>) -> Result<Self, Self::Rejection> {
         let token = parts
             .headers
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(ApiError::unauthorized)?;
-        let hash = sha256(token.as_bytes());
-        relay.with_db(|conn| {
-            let found: Option<(String, String)> = conn
-                .query_row(
-                    "SELECT id, user_id FROM devices WHERE token_hash = ?1",
-                    [&hash],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
-            let (device_id, user_id) = found.ok_or_else(ApiError::unauthorized)?;
-            conn.execute(
-                "UPDATE devices SET last_seen = ?1 WHERE id = ?2",
-                params![now(), device_id],
-            )?;
-            Ok(AuthDevice { device_id, user_id })
-        })
+        relay.authenticate(token)?.ok_or_else(ApiError::unauthorized)
     }
 }
 
@@ -260,10 +460,7 @@ impl FromRequestParts<Arc<Relay>> for AuthDevice {
 // Accounts
 // ---------------------------------------------------------------------------
 
-async fn register(
-    State(relay): State<Arc<Relay>>,
-    Json(req): Json<RegisterRequest>,
-) -> ApiResult<RegisterResponse> {
+async fn register(State(relay): State<Arc<Relay>>, Json(req): Json<RegisterRequest>) -> ApiResult<RegisterResponse> {
     validate_username(&req.username)?;
     relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -279,12 +476,11 @@ async fn register(
             Some((None, expires_at)) if expires_at >= now() => {}
             _ => return Err(ApiError::forbidden("invite code is invalid, used or expired")),
         }
-        let taken: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1)",
-                [&req.username],
-                |r| r.get(0),
-            )?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1)",
+            [&req.username],
+            |r| r.get(0),
+        )?;
         if taken {
             return Err(ApiError::new(StatusCode::CONFLICT, "username is taken"));
         }
@@ -348,6 +544,12 @@ async fn upload_key_packages(
     }
     relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if req.replace {
+            tx.execute(
+                "DELETE FROM key_packages WHERE device_id = ?1 AND last_resort = 0",
+                [&me.device_id],
+            )?;
+        }
         let have: i64 = tx.query_row(
             "SELECT COUNT(*) FROM key_packages WHERE device_id = ?1 AND last_resort = 0",
             [&me.device_id],
@@ -483,21 +685,15 @@ async fn create_chat(
 struct ChatRow {
     epoch: u64,
     next_seq: u64,
-    last_commit_hash: Option<Vec<u8>>,
 }
 
 fn load_chat(conn: &Connection, chat_id: &str) -> Result<ChatRow, ApiError> {
-    conn.query_row(
-        "SELECT epoch, next_seq, last_commit_hash FROM chats WHERE id = ?1",
-        [chat_id],
-        |r| {
-            Ok(ChatRow {
-                epoch: r.get::<_, i64>(0)? as u64,
-                next_seq: r.get::<_, i64>(1)? as u64,
-                last_commit_hash: r.get(2)?,
-            })
-        },
-    )
+    conn.query_row("SELECT epoch, next_seq FROM chats WHERE id = ?1", [chat_id], |r| {
+        Ok(ChatRow {
+            epoch: r.get::<_, i64>(0)? as u64,
+            next_seq: r.get::<_, i64>(1)? as u64,
+        })
+    })
     .optional()?
     .ok_or_else(|| ApiError::not_found("no such chat"))
 }
@@ -533,7 +729,9 @@ async fn submit_commit(
         return Err(ApiError::bad_request("commit is empty or too large"));
     }
     if req.added_devices.is_empty() != req.welcome.is_none() {
-        return Err(ApiError::bad_request("a Welcome is required exactly when devices are added"));
+        return Err(ApiError::bad_request(
+            "a Welcome is required exactly when devices are added",
+        ));
     }
     if let Some(w) = &req.welcome {
         if w.0.len() > MAX_HANDSHAKE_BYTES {
@@ -545,34 +743,57 @@ async fn submit_commit(
     }
     let commit_hash = sha256(&req.commit.0);
 
-    relay.with_db(|conn| {
+    let (response, commit_to, welcome_to) = relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chat = load_chat(&tx, &chat_id)?;
+
+        // A retry of a Commit we already accepted (the response got lost, or
+        // the app crashed before hearing back) succeeds again instead of
+        // failing as a conflict, even if newer Commits have landed since.
+        // Only the author has these exact bytes, so this reveals nothing.
+        if req.epoch < chat.epoch {
+            let accepted: Option<(Vec<u8>, i64)> = tx
+                .query_row(
+                    "SELECT hash, chat_seq FROM commit_log WHERE chat_id = ?1 AND epoch = ?2",
+                    params![chat_id, req.epoch as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((hash, seq)) = accepted {
+                if hash == commit_hash {
+                    let response = CommitResponse {
+                        epoch: req.epoch + 1,
+                        chat_seq: seq as u64,
+                    };
+                    return Ok((response, Vec::new(), Vec::new()));
+                }
+            }
+        }
+
         let members = chat_members(&tx, &chat_id)?;
         if !members.contains(&me.device_id) {
             return Err(ApiError::forbidden("not a member of this chat"));
         }
-
-        // A retry of a Commit we already accepted (say the response got lost)
-        // succeeds again instead of failing as a conflict.
-        if chat.last_commit_hash.as_deref() == Some(commit_hash.as_slice())
-            && chat.epoch == req.epoch + 1
-        {
-            return Ok(Json(CommitResponse {
-                epoch: chat.epoch,
-                chat_seq: chat.next_seq - 1,
-            }));
-        }
         if chat.epoch != req.epoch {
             return Err(ApiError::epoch_conflict(chat.epoch));
+        }
+        // A Commit moves its author to the next epoch at once. Anything still
+        // waiting in their mailbox for this chat was sent in this epoch and
+        // could never be decrypted afterwards, so they must catch up first.
+        let behind: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mailbox WHERE device_id = ?1 AND chat_id = ?2)",
+            params![me.device_id, chat_id],
+            |r| r.get(0),
+        )?;
+        if behind {
+            return Err(ApiError::unread_mail(chat.epoch));
         }
 
         for (i, d) in req.added_devices.iter().enumerate() {
             if members.contains(d) || req.added_devices[..i].contains(d) {
                 return Err(ApiError::bad_request("device is already a member"));
             }
-            let exists: bool =
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1)", [d], |r| r.get(0))?;
+            let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1)", [d], |r| r.get(0))?;
             if !exists {
                 return Err(ApiError::bad_request("unknown device in added_devices"));
             }
@@ -605,15 +826,25 @@ async fn submit_commit(
             )?;
         }
         tx.execute(
-            "UPDATE chats SET epoch = epoch + 1, next_seq = next_seq + 1, last_commit_hash = ?1 WHERE id = ?2",
-            params![commit_hash, chat_id],
+            "UPDATE chats SET epoch = epoch + 1, next_seq = next_seq + 1 WHERE id = ?1",
+            [&chat_id],
+        )?;
+        tx.execute(
+            "INSERT INTO commit_log (chat_id, epoch, hash, chat_seq, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chat_id, req.epoch as i64, commit_hash, seq as i64, now()],
         )?;
         tx.commit()?;
-        Ok(Json(CommitResponse {
+        let commit_to: Vec<String> = members.into_iter().filter(|m| *m != me.device_id).collect();
+        let response = CommitResponse {
             epoch: chat.epoch + 1,
             chat_seq: seq,
-        }))
-    })
+        };
+        Ok((response, commit_to, req.added_devices.clone()))
+    })?;
+    // Key changes are silent (no push); being added to a chat wakes you up.
+    relay.notify(&commit_to, false);
+    relay.notify(&welcome_to, true);
+    Ok(Json(response))
 }
 
 async fn send_message(
@@ -625,7 +856,7 @@ async fn send_message(
     if req.ciphertext.0.is_empty() || req.ciphertext.0.len() > MAX_MESSAGE_BYTES {
         return Err(ApiError::bad_request("message is empty or too large"));
     }
-    relay.with_db(|conn| {
+    let (response, recipients) = relay.with_db(|conn| {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let chat = load_chat(&tx, &chat_id)?;
         let members = chat_members(&tx, &chat_id)?;
@@ -636,13 +867,102 @@ async fn send_message(
             return Err(ApiError::epoch_conflict(chat.epoch));
         }
         let seq = chat.next_seq;
-        for m in members.iter().filter(|m| **m != me.device_id) {
+        let recipients: Vec<String> = members.into_iter().filter(|m| *m != me.device_id).collect();
+        for m in &recipients {
             deliver(&tx, m, &chat_id, seq, MailKind::Message, &req.ciphertext.0)?;
         }
         tx.execute("UPDATE chats SET next_seq = next_seq + 1 WHERE id = ?1", [&chat_id])?;
         tx.commit()?;
-        Ok(Json(SendMessageResponse { chat_seq: seq }))
+        Ok::<_, ApiError>((SendMessageResponse { chat_seq: seq }, recipients))
+    })?;
+    // Receipts and profile updates still arrive live; they just don't wake
+    // a sleeping phone.
+    relay.notify(&recipients, !req.silent);
+    Ok(Json(response))
+}
+
+// ---------------------------------------------------------------------------
+// Web push subscriptions
+// ---------------------------------------------------------------------------
+
+async fn vapid_key(State(relay): State<Arc<Relay>>) -> Json<VapidKeyResponse> {
+    Json(VapidKeyResponse {
+        public_key: relay.push.public_key().to_owned(),
     })
+}
+
+async fn set_push(
+    State(relay): State<Arc<Relay>>,
+    me: AuthDevice,
+    Json(sub): Json<PushSubscription>,
+) -> ApiResult<serde_json::Value> {
+    if sub.endpoint.len() > 2048 || !relay.push.endpoint_allowed(&sub.endpoint) {
+        return Err(ApiError::bad_request("push endpoint isn't at a known push service"));
+    }
+    relay.with_db(|conn| {
+        conn.execute(
+            "INSERT INTO push_subscriptions (device_id, endpoint, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device_id) DO UPDATE SET endpoint = excluded.endpoint, updated_at = excluded.updated_at",
+            params![me.device_id, sub.endpoint, now()],
+        )?;
+        Ok(Json(serde_json::json!({ "ok": true })))
+    })
+}
+
+async fn delete_push(State(relay): State<Arc<Relay>>, me: AuthDevice) -> ApiResult<serde_json::Value> {
+    relay.with_db(|conn| {
+        conn.execute("DELETE FROM push_subscriptions WHERE device_id = ?1", [&me.device_id])?;
+        Ok(Json(serde_json::json!({ "ok": true })))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Encrypted attachments
+// ---------------------------------------------------------------------------
+
+async fn upload_blob(
+    State(relay): State<Arc<Relay>>,
+    me: AuthDevice,
+    body: axum::body::Bytes,
+) -> ApiResult<BlobResponse> {
+    if body.is_empty() {
+        return Err(ApiError::bad_request("empty upload"));
+    }
+    let id = random_id();
+    relay.with_db(|conn| {
+        conn.execute(
+            "INSERT INTO blobs (id, uploader, data, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, me.device_id, body.as_ref(), now()],
+        )?;
+        Ok(Json(BlobResponse {
+            id,
+            size: body.len() as u64,
+        }))
+    })
+}
+
+async fn download_blob(
+    State(relay): State<Arc<Relay>>,
+    _me: AuthDevice,
+    UrlPath(blob_id): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    if blob_id.len() != 32 || !blob_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::not_found("no such attachment"));
+    }
+    let data: Option<Vec<u8>> = relay.with_db(|conn| {
+        conn.query_row("SELECT data FROM blobs WHERE id = ?1", [&blob_id], |r| r.get(0))
+            .optional()
+    })?;
+    let data = data.ok_or_else(|| ApiError::not_found("no such attachment"))?;
+    Ok((
+        [
+            (CONTENT_TYPE, "application/octet-stream"),
+            // Ciphertext never changes for a given id.
+            (CACHE_CONTROL, "private, max-age=2592000, immutable"),
+        ],
+        data,
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------

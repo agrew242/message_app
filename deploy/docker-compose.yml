@@ -1,0 +1,47 @@
+# The relay, plus Caddy in front of it for HTTPS. See SETUP.md.
+#
+#   cp .env.example .env      # then fill it in
+#   docker compose up -d --build
+#   docker compose logs relay # the first invite code is here
+
+name: messenger
+
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Only the web app's own site may call the relay from a browser.
+      RELAY_ALLOWED_ORIGINS: ${APP_ORIGIN:?set APP_ORIGIN in .env}
+      # Push services (Apple, Google, Mozilla) contact this if something's wrong.
+      RELAY_VAPID_SUBJECT: mailto:${CONTACT_EMAIL:?set CONTACT_EMAIL in .env}
+      RUST_LOG: info
+    volumes:
+      - relay-data:/data
+    # Not published: only Caddy can reach it.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - relay
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+      CONTACT_EMAIL: ${CONTACT_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

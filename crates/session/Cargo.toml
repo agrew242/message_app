@@ -1,0 +1,13 @@
+[package]
+name = "messenger-session"
+description = "Everything the app does, on any platform: drives the encryption core against the relay. Network and storage come from the platform through a small trait."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+messenger-core.workspace = true
+messenger-protocol.workspace = true
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+thiserror.workspace = true

@@ -3,3 +3,7 @@
 *.db-wal
 *.db-shm
 .msg/
+crates/wasm/pkg/
+deploy/.env
+deploy/backups/
+app/web_tests/screenshots/
